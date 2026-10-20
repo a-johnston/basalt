@@ -9,8 +9,8 @@ The current version. The engine refuses version 1 files and names
 [tools/migrations/basalt_v1_to_v2.py](../tools/migrations/README.md), which writes a version 2 file from a version 1 file without a
 download or any re-quantizing.
 
-- **Contains:** `meta`, `tokenizer/*`, `dense`, `dense.index`, `experts`, `experts.layout`, `gguf`, `mtp/*`, `hc8`,
-  `dspark/gguf`, `vision/*`.
+- **Contains:** `meta`, `tokenizer/*`, `dense`, `dense.index`, `experts`, `experts.layout`, `experts.hadamard`, `gguf`,
+  `mtp/*`, `hc8`, `dspark/gguf`, `vision/*`.
 - **Added `hc8`, now required:** the int8 copies of the hyper-connection matrices the decode reads, the bits the
   engine used to compute at every start. A start reads them as they are and skips reading the BF16 matrices to
   quantize them (about half a second).
@@ -26,6 +26,9 @@ download or any re-quantizing.
 - **Tensor type 44, `F8_E4M3`, no version change:** one E4M3 code per value with the matrix's FP32 scale as a separate
   `<name>.scale` tensor (F32 [1]), as NVIDIA's FP8 checkpoints store them. The Qwen3.8-27B pack's projections use it. An engine
   from before it refuses such a tensor by name ("the dense kernels read ...").
+- **Added `experts.hadamard`, optional, no version change:** a pack whose experts are Hadamard-folded (`prism.hadamard`
+  metadata) names the block, the sign vectors and each layer's folded roles in it, and its `experts.layout` header says
+  `hadamard` after the totals. The engine refuses either one without the other.
 - **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
   does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or
