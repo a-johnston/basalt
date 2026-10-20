@@ -48,6 +48,7 @@
 #include "basalt/program/gpu_select.hpp"
 #include "basalt/program/multi_gpu_plan.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/tq_cpu.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"

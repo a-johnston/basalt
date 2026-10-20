@@ -161,6 +161,13 @@ double probe_h2d_together_gbps(const std::vector<int>& devs) {
 // The PCIe share of the missed experts for a link measured at `gbps`: `base` (the share for a x16 link) from 20 GB/s
 // up, and below that in proportion to the bandwidth, so the time the link spends on its share stays about what the
 // x16 share costs.  Continuous, so a reading near either edge does not move the share by a large part of its range.
+// Trellis decoding costs more CPU work per byte, so the link takes a larger share.
+double pcie_base_share() {
+    for (const auto& f : basalt::kernels::cpu::expert_layout().fmt)
+        if (basalt::kernels::cpu::tq_supported(f.gu_type) || basalt::kernels::cpu::tq_supported(f.d_type)) return 0.65;
+    return 0.55;
+}
+
 double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
