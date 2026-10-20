@@ -656,8 +656,9 @@ class HadamardTest(unittest.TestCase):
             with self.subTest(what):
                 with self.assertRaises(S.ConvertError):
                     S.hadamard_text(m, self.layout(), self.N_EMBD, self.N_FF)
-        with self.assertRaisesRegex(S.ConvertError, "Q2_0"):
-            S.hadamard_text(self.meta(), self.layout(gu=42), self.N_EMBD, self.N_FF)
+        for gu, d in ((42, 149), (21, 149), (148, 20)):   # Q2_0, IQ3_S gate/up; IQ4_NL down
+            with self.assertRaisesRegex(S.ConvertError, "trellis types"):
+                S.hadamard_text(self.meta(), self.layout(gu=gu, d=d), self.N_EMBD, self.N_FF)
 
     def test_layout_header_says_hadamard(self):
         e = S.Experts.__new__(S.Experts)
