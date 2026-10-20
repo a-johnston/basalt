@@ -293,7 +293,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // the default stays.
     double main_link_gbps = 0;   // the probed host->device bandwidth (the prompt-time split's price reads it)
     if (o.pcie_frac < 0.0) {
-        const double base = 0.55;
+        const double base = pcie_base_share();
         std::string bursts;
         const double bw = probe_pcie_h2d_gbps(&bursts);
         main_link_gbps = bw;

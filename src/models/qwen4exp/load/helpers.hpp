@@ -35,6 +35,7 @@ bool for_each_index_name(const basalt::core::FileRange& index, const std::functi
 int argmax(const std::vector<float>& v);
 double probe_pcie_h2d_gbps(std::string* samples = nullptr);
 double probe_h2d_together_gbps(const std::vector<int>& devs);
+double pcie_base_share();
 double pcie_frac_for_gbps(double gbps, double base);
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
