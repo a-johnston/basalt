@@ -39,6 +39,7 @@ bool Verifier::dm_init(std::string& err) {
     for (int64_t l = 0; why == nullptr && l < g.n_layers; ++l) {
         const auto& f = lay.fmt[(size_t) l];
         if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)) why = "an expert format the kernels do not cover";
+        else if (f.had_gu || f.had_d) why = "Hadamard-folded experts";
     }
     if (why != nullptr) {
         basalt::log::warn("basalt verify", "the device-planned MoE tail is off: %s", why);
@@ -119,7 +120,7 @@ bool Verifier::dm_init(std::string& err) {
         std::vector<NativeExpertLayout> ls((size_t) g.n_layers);
         for (int64_t l = 0; l < g.n_layers; ++l) {
             const auto& f = lay.fmt[(size_t) l];
-            ls[(size_t) l] = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type);
+            ls[(size_t) l] = native_expert_layout(f);
             d->pq2 |= f.gu_type == 42;
         }
         d->pblocks = dec_moe_peer_blocks(d->pq2);

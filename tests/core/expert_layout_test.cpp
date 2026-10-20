@@ -95,7 +95,9 @@ void refusals() {
     check(load(layout(5, blob, ""), 2, 512, err), "a v5 layout loads" + (err.empty() ? "" : ": " + err));
     check(load(layout(3, blob, " 100 200 300 shard.gguf"), 2, 512, err),
           "columns past the fifth are ignored" + (err.empty() ? "" : ": " + err));
-    check(!load(layout(8, blob, ""), 2, 512, err) && err.find("v8") != std::string::npos, "v8 is refused");
+    const int newer = basalt::kernels::cpu::kExpertLayoutVersion + 1;
+    check(!load(layout(newer, blob, ""), 2, 512, err) && err.find("v" + std::to_string(newer)) != std::string::npos,
+          "a newer layout is refused");
     // NVFP4: the blob carries a 16-byte FP32 scale tail after down, counted in the blob size
     basalt::kernels::cpu::NativeFmt nv;
     check(basalt::kernels::cpu::native_fmt(40, 40, 2560, 640, nv, err) && nv.tail == 16 &&
@@ -136,6 +138,32 @@ void mixed() {
               !c::native_fmt(22, 42, 2560, 640, x, err, 0.f, 8),
           "Q2_0, NVFP4 or another activation format beside a different type is refused");
 }
+
+// ---- 4. Hadamard-folded experts: the header's flag and the experts.hadamard section come together
+void folded() {
+    namespace c = basalt::kernels::cpu;
+    std::string err;
+    c::NativeFmt t;
+    if (!c::native_fmt(148, 149, 2560, 640, t, err)) {
+        check(false, "TQP6/TQP7 native format: " + err);
+        return;
+    }
+    const std::string b = std::to_string(t.bytes), total = std::to_string(4 * t.bytes);
+    const std::string lines = "0 148 149 0 " + b + "\n1 148 149 " + std::to_string(2 * t.bytes) + " " + b + "\n";
+    const std::string flagged = "# experts v5: x (n_expert 2, total " + total + ", hadamard)\n" + lines;
+    const std::string plain = "# experts v5: x (n_expert 2, total " + total + ")\n" + lines;
+    const std::string had = "# basalt hadamard v1\nblock 128\nlayer 0 1 1 1\nlayer 1 1 1 1\n";
+    auto load_had = [&](const std::string& text, const std::string& h) {
+        err.clear();
+        return c::expert_layout_load_text(text, 2, 512, err, 2560, 640, 0.f, h);
+    };
+    check(load_had(flagged, had) && c::expert_layout().fmt[1].had_gu && c::expert_layout().fmt[1].had_d &&
+              c::expert_layout().fmt[1].had_block == 128,
+          "a flagged layout with its section folds every layer" + (err.empty() ? "" : ": " + err));
+    check(!load_had(flagged, ""), "a flagged layout without the section is refused");
+    check(!load_had(plain, had), "the section beside a layout without the flag is refused");
+    check(load_had(plain, "") && !c::expert_layout().fmt[0].had_gu, "neither: nothing is folded");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -146,6 +174,7 @@ int main(int argc, char** argv) {
     }
     real_layouts(argv[1]);
     refusals();
+    folded();
     mixed();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;

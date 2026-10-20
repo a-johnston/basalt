@@ -1,5 +1,6 @@
 // src/kernels/cpu/expert_layout.cpp - the per-layer expert table.  See the header.
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/kernels/cpu/hadamard.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -131,7 +132,7 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 
 
 bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
-                             int64_t n_embd, int64_t n_ff, float swiglu_limit) {
+                             int64_t n_embd, int64_t n_ff, float swiglu_limit, const std::string& hadamard) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -146,6 +147,7 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
     std::string line;
+    bool folded = false;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
@@ -164,7 +166,11 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
                 // the header records the expert count; a pruned model ships fewer experts than the geometry the
                 // caller passes, which is a compile-time default, so the header wins.
                 const size_t at = line.find("(n_expert ");
-                if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                if (at != std::string::npos) {
+                    L.n_expert = std::atoll(line.c_str() + at + 10);
+                    // ", hadamard" after the totals: the experts are Hadamard-folded
+                    folded = line.find(", hadamard", at) < line.find(')', at);
+                }
             }
             continue;
         }
@@ -197,6 +203,45 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
+    // Hadamard-folded experts: the header's flag and the section that says which layers are rotated and with what
+    // signs come together, so a folded model never runs unrotated
+    if (folded != !hadamard.empty()) {
+        err = folded ? "the expert layout says hadamard but the model has no experts.hadamard section"
+                     : "the model has an experts.hadamard section but its expert layout does not say hadamard";
+        return false;
+    }
+    HadamardSpec hs;
+    if (!hadamard.empty() && !hadamard_parse(hadamard, n_layers, hs, err)) return false;
+    hadamard_set(std::move(hs));
+    const HadamardSpec& h = hadamard_spec();
+    for (int64_t l = 0; h.any() && l < n_layers; ++l) {
+        NativeFmt& f = L.fmt[(size_t) l];
+        f.had_block = h.block;
+        f.had_gu = h.gu(l);
+        f.had_d = h.down(l);
+        if ((f.had_gu && f.n_embd % h.block) || (f.had_d && f.n_ff % h.block)) {
+            err = "experts.hadamard: block " + std::to_string(h.block) + " does not divide layer " + std::to_string(l) +
+                  "'s expert widths";
+            return false;
+        }
+        // the GPU's rotated SwiGLU has no limit
+        if (f.had_d && f.swiglu_limit > 0.f) {
+            err = "experts.hadamard: layer " + std::to_string(l) + " folds the down rows of a SwiGLU-limited model";
+            return false;
+        }
+        // the Q2_0 rows quantize their activations with act_quant_any, which does not rotate
+        if ((f.had_gu && f.gu_type == 42) || (f.had_d && f.d_type == 42)) {
+            err = "experts.hadamard: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
+            return false;
+        }
+        f.gu_signs = f.had_gu ? hadamard_signs((int) f.n_embd) : nullptr;
+        f.d_signs = f.had_d ? hadamard_signs((int) f.n_ff) : nullptr;
+        // explicit signs are per width: a width without a vector would silently mean identity signs
+        if (!h.signs.empty() && ((f.had_gu && !f.gu_signs) || (f.had_d && !f.d_signs))) {
+            err = "experts.hadamard: no sign vector for layer " + std::to_string(l) + "'s expert width";
+            return false;
+        }
+    }
     g_layout = L;
     return true;
 }
