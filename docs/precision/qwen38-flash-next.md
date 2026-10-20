@@ -27,6 +27,8 @@ build. Geometry: 2560 hidden, 4 hyper-connection streams, 48 layers (36 GDN, 12 
 |---|---|---|
 | Routed experts (GGUF packs) | GGUF blocks, byte for byte; mixed types across layers, and within one (UD-IQ1_S: IQ2_S gate, IQ2_XXS up) | q8_1 activations, dp4a or int8 mma, fp32 scales |
 | Routed experts (NVFP4) | NVIDIA's E2M1 codes and UE4M3 scales, 4.5 bits/weight; FP32 tail `{s_gate, s_up, s_down}` | q8_1 activations, exact int32 per 16-value sub-block, fp32 scales; tails applied in fp32 |
+| Routed experts (APR trellis packs) | TQ2_T, TQK6/7, TQP5/6/7 (ggml 144-149): per 128 weights an fp16 scale and K-bit trellis steps, each state hashed to a point of a 2048-point fp16 codebook | int8 codebook (scale 3.984375/127), dp4a against q8_1, exact int32 per lane, fp32 scales |
+| Hadamard-folded experts (`experts.hadamard`) | stored weight W diag(s) H_128^T | H_128 (s ⊙ x) and H_128 (s ⊙ h) in fp32 (the CPU in the same butterfly order), then q8_1; the device-planned MoE tail is off for folded layers |
 | Dense projections (attention, GDN qkv/z/out, QSA) | Q8_0 (or Q6_K in the NVFP4 pack; Q4_K/Q5_K/Q6_K in others) | q8_1 activations, int8 tensor-core dot, exact int32 per 32 block |
 | Router, GDN alpha/beta, indexer, PLE key/value | BF16 as stored | fp32 activations and sums |
 | Hyper-connections | int8 copy, one fp16 scale per 32 inputs (`hc8`); the hc read takes fp32 activations | fp32 sums; the up product uses fp16 hi/lo mma |
@@ -44,6 +46,10 @@ GPU experts run the same kernels on every tier, so an expert gives the same bits
 ggml's `vec_dot_type` (Q8_K per 256 for i-quant gate/up, Q8_0 for down). They round about 1% of a layer's routed output differently, so
 which experts sit where changes the last bits. Pin `--adapt-swaps 0 --peer-adapt-swaps 0` for identity checks.
 
+Trellis experts on the CPU take Q8_0 activations (rotated first on folded layers) against an int16 codebook at scale 2^13 (exact from
+magnitude 2^-3, within 2^-14 below), exact int32 sums per 32 weights and four fp32 accumulators in a fixed order: scalar, AVX2, AVX-512
+and every token-group size give the same bits (`tq_expert_parity`).
+
 ### Prefill
 
 Prefill is a different computation from decode: fp16 and BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts. The gate
@@ -54,6 +60,7 @@ scores the decode path.
 | Dense projections | fp16 weights and activations, cuBLAS, fp32 accumulate | fp16 activations |
 | Routed experts, MMQ | q8_1 activations, int8 mma | int8 activation rounding (every MMQ format) |
 | Routed experts, FP4 tensor cores (NVFP4, chunks of 1,024 or more) | E2M1 activations with a UE4M3 scale per 16 values and one fp32 scale per token; `mma kind::mxf4nvf4` | W4A4; numerics change against MMQ |
+| Routed experts, trellis types | dequantized to fp16 (codebook point times block scale), cuBLAS; folded layers rotate the gathered fp16 inputs and the fp16 SwiGLU output in fp32 | fp16 weights and activations |
 | Routed experts, CPU pool (chunks under 6,144 tokens) | ggml dot products, the same as decode's RAM tier | the CPU rounding above |
 | Attention | int8 and fp16 KV: q and p in fp16, one fp16 mma, fp32 accumulate (q4_0 KV: hi + lo fp16 parts) | output within 1.5e-3 of an FP64 reference |
 | GDN | chunked delta rule, 16 tokens per chunk; state and gates fp32; BF16 and TF32 tensor cores | output depends on where the 16-token grid falls (about 1e-3 relative) |

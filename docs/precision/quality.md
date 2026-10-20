@@ -40,7 +40,8 @@ The bases are published as the [basalt-kld-bases](https://huggingface.co/dataset
 with checksums: pass one to `basalt-bench --quality --kld-base FILE` to score a build or a self-converted pack.
 
 A quantized base is not a reference. llama.cpp's Q8_0 GGUF adds its own rounding, so every pack reads 0.003 to 0.010 KLD higher against a
-Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)).
+Q8_0 base than against BF16 (see [Flash-Next](qwen38-flash-next.md#summary)). The
+[trellis development measurements](trellis-quality.md) use a Q8_0 base and do not meet the BF16 gate.
 
 Numerics changes: report PPL, mean KLD and top-1 next to the previous build. Bitwise-neutral changes: show greedy identity.
 
