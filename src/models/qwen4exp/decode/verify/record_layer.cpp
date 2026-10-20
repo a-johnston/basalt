@@ -233,7 +233,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     glue_on = false;
     if (pk_ring && v_.dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
         const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
-        glue_on = v_.dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type));
+        glue_on = v_.dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f));
         if (!glue_on) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
     }
     // the read's router items also dot the shared expert's gate input and write its q8_1 rows: its side branch is
@@ -402,8 +402,13 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         }
     }
     if (dm) {}   // the route kernel wrote nat_xq_
-    else if (basalt::kernels::cpu::expert_layout().native)
-        quantize_q8_1_rows(xm, n, N, v_.nat_xq_, cs);
+    else if (basalt::kernels::cpu::expert_layout().native) {
+        const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
+        if (f.had_gu)
+            hadamard_q8_1_rows(xm, n, N, f.had_block, native_expert_gu_signs(f), v_.nat_xq_, cs);
+        else
+            quantize_q8_1_rows(xm, n, N, v_.nat_xq_, cs);
+    }
     else
         quantize_q8_0_scaled(xm, v_.hit_xq_, v_.hit_xs_, (int64_t) n * N, cs);
     stamp(l, 18);

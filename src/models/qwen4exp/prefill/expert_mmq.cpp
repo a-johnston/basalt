@@ -6,6 +6,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/models/qwen4exp/prefill/kernels.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
 #include <cstring>
@@ -41,6 +42,9 @@ void Prefill::Run::Chunk::Experts::Group::prepare_products() {
         }
     } else {
         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+        if (lay.native && lay.fmt[(size_t) l].had_gu)
+            basalt::kernels::hadamard_rows_f16(m.Xs, T * K, N, lay.fmt[(size_t) l].had_block,
+                                              m.had_sx[(size_t) l], m.cs);
     }
     // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
 }

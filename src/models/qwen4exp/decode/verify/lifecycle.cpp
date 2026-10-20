@@ -279,6 +279,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    // Resolve device sign vectors before graph capture.
+    for (const auto& f : basalt::kernels::cpu::expert_layout().fmt) {
+        basalt::kernels::native_expert_layout(f);
+        basalt::kernels::native_expert_gu_signs(f);
+    }
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
     int cs_least = 0, cs_greatest = 0;

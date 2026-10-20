@@ -340,8 +340,8 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         return false;
     }
     const auto& f = lay.fmt[(size_t) layer];
-    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, f.up_type);
-    return launch_layout(layer, L, x, ids, n_tok, k, kind, err, out);
+    return launch_layout(layer, basalt::kernels::native_expert_layout(f), x, ids, n_tok, k, kind, err, out,
+                         f.had_gu ? f.had_block : 0, basalt::kernels::native_expert_gu_signs(f));
 }
 
 bool PeerExperts::plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups,
@@ -527,7 +527,8 @@ bool PeerExperts::run_fetched(std::string& err) {
 }
 
 bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
-                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err, float* out) {
+                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err, float* out,
+                                int gu_block, const float* gu_signs) {
     const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_rows_ = 0;
@@ -542,7 +543,8 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
     if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
-    basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+    if (gu_block > 0) basalt::kernels::hadamard_q8_1_rows(d_x_, n_tok, n_embd_, gu_block, gu_signs, d_q8_, s);
+    else basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
     Meta* dm = (Meta*) d_meta_;
     basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
     basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
