@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
     // zero words: exactly the first n of them
     for (int n : {0, 1, 5, 16, 256}) {
         std::vector<unsigned int> w(256);
-        if (!ck(cudaMemset(d_zero, 0xff, 256 * 4), "memset") ||
+        if (!ck(cudaMemsetAsync(d_zero, 0xff, 256 * 4, s), "memset") ||
             !basalt::kernels::dec_moe_zero_words(d_zero, n, s) || !ck(cudaStreamSynchronize(s), "sync") ||
             !ck(cudaMemcpy(w.data(), d_zero, 256 * 4, cudaMemcpyDeviceToHost), "read back"))
             return 1;
