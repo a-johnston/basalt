@@ -3605,8 +3605,8 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
 // widths): it exits with a message, like check() does for a failed launch.
 namespace {
 void hadamard_bad_block(const char* what, int block, int64_t width) {
-    std::fprintf(stderr, "%s: Hadamard block %d is not a power of two in [2, 1024] dividing the row width %lld "
-                         "(the pack's Hadamard block and the expert widths disagree)\n", what, block, (long long) width);
+    basalt::log::error("basalt", "%s: Hadamard block %d is not a power of two in [2, 1024] dividing the row width %lld "
+                                 "(the pack's Hadamard block and the expert widths disagree)", what, block, (long long) width);
     std::exit(1);
 }
 bool hadamard_block_ok(int block, int64_t width) {
@@ -3652,7 +3652,7 @@ const float* hadamard_device_signs(const float* host, int width) {
     if (d == nullptr) {
         if (cudaMalloc((void**) &d, (size_t) width * sizeof(float)) != cudaSuccess ||
             cudaMemcpy(d, host, (size_t) width * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
-            std::fprintf(stderr, "hadamard_device_signs: %s\n", cudaGetErrorString(cudaGetLastError()));
+            basalt::log::error("basalt", "hadamard_device_signs: %s", cudaGetErrorString(cudaGetLastError()));
             std::exit(1);
         }
     }
