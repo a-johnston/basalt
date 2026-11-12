@@ -644,13 +644,26 @@ __global__ void ple_hist_seg_kernel(float* __restrict__ work, float* const* __re
         dst[i] = src[i];
 }
 
+// A thread keeps kFetchIlp loads in flight, so a few blocks fill the link and the SMs stay free for the kernels
+// beside the copy.
+constexpr int kFetchIlp = 8;
+constexpr int kFetchBlocks = 8;
 __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                    uint4* __restrict__ dst, long long per) {
-    const long long total = (long long) *n * per;
-    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (long long) gridDim.x * blockDim.x) {
-        const long long k = i / per, off = i - k * per;
-        dst[i] = ((const uint4*) src[k])[off];
+    const long long total = (long long) *n * per, step = (long long) gridDim.x * blockDim.x;
+    for (long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x; i0 < total; i0 += step * kFetchIlp) {
+        uint4 v[kFetchIlp];
+#pragma unroll
+        for (int j = 0; j < kFetchIlp; ++j) {
+            const long long i = i0 + j * step;
+            if (i < total) {
+                const long long k = i / per;
+                v[j] = ((const uint4*) src[k])[i - k * per];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kFetchIlp; ++j)
+            if (i0 + j * step < total) dst[i0 + j * step] = v[j];
     }
 }
 
@@ -723,7 +736,7 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { basalt::log::error("basalt", "fetch_blobs: blob size must be a multiple of 16"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    fetch_blobs_kernel<<<kFetchBlocks, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
 }
 

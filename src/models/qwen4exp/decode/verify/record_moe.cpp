@@ -144,16 +144,18 @@ bool Verifier::WindowRecorder::post(int64_t l) {
             copy_i32_from_mapped(pl, v_.m_plan_, v_.plan_i32_, cs);
         }
         stamp(l, 19);
+        // the PCIe groups, once planned, are copied into staging (then pointed at it) on their own stream while the
+        // VRAM groups compute, so the link and the SMs' arithmetic overlap
+        cudaEventRecord(v_.pf_fork_, cs);
+        cudaStreamWaitEvent(v_.pf_s_, v_.pf_fork_, 0);
+        if (v_.device_plan_) wait_flag_ge_or(v_.m_flagB_, ring, v_.skip_, v_.pf_s_);
+        else wait_flag_ge(v_.m_flagB_, ring, v_.pf_s_);
+        fetch_blobs(p_ptr2, p_counts + 2, v_.staging_, (int64_t) lay.blob_bytes(l), (int) kStagingBlobs, v_.pf_s_);
+        rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, v_.staging_, (int64_t) lay.blob_bytes(l), v_.pf_s_);
+        cudaEventRecord(v_.pf_join_, v_.pf_s_);
         grouped(p_ptr, p_start, p_counts, 0, hit_out);
         stamp(l, 20);
-        if (v_.device_plan_) wait_flag_ge_or(v_.m_flagB_, ring, v_.skip_, cs);
-        else wait_flag_ge(v_.m_flagB_, ring, cs);                 // the PCIe groups are planned
-        {   // stage them with a copy kernel, then point at staging
-            const int64_t per = kStagingBlobs;
-            uint8_t* stage = v_.staging_;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-        }
+        cudaStreamWaitEvent(cs, v_.pf_join_, 0);
         stamp(l, 21);
         // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (none when the
         // share is 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them

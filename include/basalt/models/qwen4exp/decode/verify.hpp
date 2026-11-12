@@ -585,6 +585,8 @@ private:
     cudaEvent_t qev_[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     cudaStream_t ring_hi_ = nullptr;   // the MoE ring's stream at the greatest priority
     cudaEvent_t ev_ring_ = nullptr, ev_ring_join_ = nullptr;
+    cudaStream_t pf_s_ = nullptr;   // the PCIe groups' copy into staging, beside the VRAM groups, at the greatest priority
+    cudaEvent_t pf_fork_ = nullptr, pf_join_ = nullptr;
     cudaStream_t ple_s_ = nullptr;   // layer 1's PLE projections, from the window's start
     cudaEvent_t ev_ple_fork_ = nullptr, ev_ple_join_ = nullptr;
     bool ple_side_ = false;          // the window's graph computes them there (the host raises h_flag_[8] with the rows)

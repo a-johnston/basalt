@@ -46,6 +46,7 @@ Verifier::~Verifier() {
     if (sh_hi_) cudaStreamSynchronize(sh_hi_);
     if (sh_hi2_) cudaStreamSynchronize(sh_hi2_);
     if (ring_hi_) cudaStreamSynchronize(ring_hi_);
+    if (pf_s_) cudaStreamSynchronize(pf_s_);
     for (cudaStream_t q : qs_)
         if (q) cudaStreamSynchronize(q);
     dm_free();
@@ -84,6 +85,9 @@ Verifier::~Verifier() {
     if (sh_hi2_) cudaStreamDestroy(sh_hi2_);
     if (ev_sh2_) cudaEventDestroy(ev_sh2_);
     if (ring_hi_) cudaStreamDestroy(ring_hi_);
+    if (pf_s_) cudaStreamDestroy(pf_s_);
+    if (pf_fork_) cudaEventDestroy(pf_fork_);
+    if (pf_join_) cudaEventDestroy(pf_join_);
     if (ple_s_) cudaStreamDestroy(ple_s_);
     if (ev_ple_fork_) cudaEventDestroy(ev_ple_fork_);
     if (ev_ple_join_) cudaEventDestroy(ev_ple_join_);
@@ -303,6 +307,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             cudaStreamCreateWithPriority(&ring_hi_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ring_, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ring_join_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&pf_s_, cudaStreamNonBlocking, greatest) != cudaSuccess ||
+            cudaEventCreateWithFlags(&pf_fork_, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&pf_join_, cudaEventDisableTiming) != cudaSuccess ||
             cudaStreamCreateWithFlags(&ple_s_, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ple_fork_, cudaEventDisableTiming) != cudaSuccess ||
             cudaEventCreateWithFlags(&ev_ple_join_, cudaEventDisableTiming) != cudaSuccess) {
