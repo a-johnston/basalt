@@ -1,13 +1,17 @@
-"""Checks tools/convert/exl3.py against ExLlamaV3 itself on a real checkpoint.  Run it with a Python that has torch
-and an ExLlamaV3 checkout built in place (not Basalt's environment):
+"""Checks tools/convert/exl3.py, and the engine's EXL3 expert, against ExLlamaV3 itself on a real
+checkpoint.  Run it with a Python that has torch and an ExLlamaV3 checkout built in place (not Basalt's environment):
 
     python tools/convert/exl3_upstream_check.py --exllamav3 DIR --checkpoint DIR [--tensor NAME ...]
+    python tools/convert/exl3_upstream_check.py --exllamav3 DIR --checkpoint DIR --expert L E --expert-io FILE
 
 The first form checks the token-embedding rows and, when the directory holds ngram_embedding.safetensors, the n-gram
 rows against `ngram_codec.dequant_rows`, then each matrix (by default one of every (kind, bitrate) pair) against
 the extension: the inner matrix bit for bit against `reconstruct`, the full weight against
 `LinearEXL3.get_weight_tensor` and a forward against the extension's GEMV.  With --tensor only the named matrices
 are checked.
+
+--expert-io compares the engine's CPU expert with ExLlamaV3's on layer L's expert E: FILE is what
+`build/exl3_expert_parity --io` wrote for that expert's blob (inputs, then the engine's outputs).
 """
 import argparse
 import json
@@ -141,12 +145,41 @@ def check_matrices(torch, ext, LinearEXL3, t, names) -> int:
     return bad
 
 
+def check_expert_io(torch, LinearEXL3, t, layer, expert, io_path) -> int:
+    lin = {r: linear(torch, LinearEXL3, t, f"model.language_model.layers.{layer}.mlp.experts.{expert}.{r}")
+           for r in ("gate_proj", "up_proj", "down_proj")}
+    h = lin["gate_proj"].in_features
+    io = np.fromfile(io_path, dtype="<f4")
+    nt = io.size // (2 * h)
+    x, y = io[:nt * h].reshape(nt, h), io[nt * h:].reshape(nt, h).astype(np.float64)
+    # the reference: the weights as ExLlamaV3 reconstructs them, the expert in double
+    w = {r: m.get_weight_tensor().double() for r, m in lin.items()}
+    xd = torch.from_numpy(x).to(DEV).double()
+    g, u = xd @ w["gate_proj"], xd @ w["up_proj"]
+    ref = ((g * torch.sigmoid(g) * u) @ w["down_proj"]).cpu().numpy()
+    # ExLlamaV3's own kernels on fp16 inputs, for scale
+    xh = torch.from_numpy(x).to(DEV).half()
+    gk, uk = lin["gate_proj"].forward(xh, {}, torch.float), lin["up_proj"].forward(xh, {}, torch.float)
+    kern = lin["down_proj"].forward((gk * torch.sigmoid(gk) * uk).half(), {}, torch.float).double().cpu().numpy()
+    rel = lambda p, q: float(np.abs(p - q).sum() / np.abs(q).sum())
+    e, ek = rel(y, ref), rel(kern, ref)
+    ok = e < 3e-3
+    print(f"{'ok  ' if ok else 'FAIL'} layer {layer} expert {expert}, {nt} tokens: engine vs ExLlamaV3's weights in "
+          f"double rel {e:.2e}, max abs {np.abs(y - ref).max():.2e} (|y| mean {np.abs(ref).mean():.2e}); ExLlamaV3's "
+          f"kernels vs the same rel {ek:.2e}")
+    return int(not ok)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exllamav3", required=True)
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--tensor", action="append", default=[])
+    ap.add_argument("--expert", nargs=2, type=int, metavar=("L", "E"))
+    ap.add_argument("--expert-io", metavar="FILE")
     a = ap.parse_args()
+    if bool(a.expert) != bool(a.expert_io):
+        ap.error("--expert and --expert-io go together")
     sys.path.insert(0, a.exllamav3)
     import torch
     from exllamav3.ext import exllamav3_ext as ext
@@ -156,12 +189,15 @@ def main():
     d = pathlib.Path(a.checkpoint)
     t = tensors(d)
     ngram = d / NGRAM_FILE
-    bad = 0
-    if not a.tensor:
-        bad += check_embeddings(torch, N, t)
-        if ngram.is_file():
-            bad += check_ngram(torch, N, ngram)
-    bad += check_matrices(torch, ext, LinearEXL3, t, a.tensor)
+    if a.expert_io:
+        bad = check_expert_io(torch, LinearEXL3, t, a.expert[0], a.expert[1], a.expert_io)
+    else:
+        bad = 0
+        if not a.tensor:
+            bad += check_embeddings(torch, N, t)
+            if ngram.is_file():
+                bad += check_ngram(torch, N, ngram)
+        bad += check_matrices(torch, ext, LinearEXL3, t, a.tensor)
     print("FAILED" if bad else "all checks pass")
     return 1 if bad else 0
 

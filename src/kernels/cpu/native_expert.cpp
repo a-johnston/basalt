@@ -12,6 +12,7 @@
 #include "basalt/kernels/cpu/swiglu.hpp"
 #include "basalt/kernels/cpu/hadamard.hpp"
 #include "basalt/kernels/cpu/tq_cpu.hpp"
+#include "basalt/kernels/cpu/exl3_cpu.hpp"
 
 #include "basalt/ggml/ggml.h"
 #include "basalt/ggml/ggml_common_tq.h"
@@ -153,6 +154,39 @@ bool weight_geometry(int type, int64_t n, size_t& row, int64_t& blck, int& act) 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 float swiglu_limit, int up_type) {
     if (up_type < 0) up_type = gu_type;
+    if (exl3_supported(gu_type) || exl3_supported(d_type)) {
+        if (!exl3_supported(gu_type) || !exl3_supported(d_type) || up_type != gu_type) {
+            err = "native experts: an EXL3 layer needs EXL3 gate, up and down of one gate/up type";
+            return false;
+        }
+        if (swiglu_limit > 0.f) {   // the EXL3 gate/up kernel has the plain SwiGLU built in
+            err = "native experts: the EXL3 types take no SwiGLU limit";
+            return false;
+        }
+        if (n_embd % kExl3Had || n_ff % kExl3Had || n_embd > kExl3MaxN || n_ff > kExl3MaxN) {
+            err = "native experts: EXL3 expert geometry is not whole 128-value blocks";
+            return false;
+        }
+        f.gu_type = gu_type;
+        f.up_type = gu_type;
+        f.d_type = d_type;
+        f.n_embd = n_embd;
+        f.n_ff = n_ff;
+        f.gu_row = exl3_matrix_bytes(gu_type, n_embd, 1);
+        f.up_row = f.gu_row;
+        f.d_row = exl3_matrix_bytes(d_type, n_ff, 1);
+        f.up_off = f.gu_row * (size_t) n_ff;
+        f.down_off = 2 * f.up_off;
+        f.tail = exl3_vec_bytes(n_embd, n_ff);
+        f.bytes = f.down_off + f.d_row * (size_t) n_embd + f.tail;
+        f.act_bytes = sizeof(float) * (size_t) n_embd;
+        f.h_bytes = sizeof(float) * (size_t) n_ff;
+        if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+            err = "native experts: activation larger than the pool's buffers";
+            return false;
+        }
+        return true;
+    }
     size_t gu_row = 0, up_row = 0, d_row = 0;
     int64_t gu_blck = 0, up_blck = 0, d_blck = 0;
     int gu_act = -1, up_act = -1, d_act = -1;
@@ -218,6 +252,10 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 }
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (exl3_supported(f.gu_type)) {   // transformed per expert, inside the row kernels
+        std::memcpy(dst, x, f.act_bytes);
+        return;
+    }
     if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself
         thread_local std::vector<float> tmp;
         tmp.assign(x, x + f.n_embd);
@@ -237,6 +275,10 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (exl3_supported(f.d_type)) {
+        std::memcpy(dst, h, f.h_bytes);
+        return;
+    }
     if (f.had_d) {
         thread_local std::vector<float> tmp;
         tmp.assign(h, h + f.n_ff);
@@ -252,6 +294,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // formats without one.  A token's rows round the same alone as in a group, so greedy output does not depend on
     // the number of drafts in a window.  A format with only an AVX-2 kernel (IQ4_XS) takes it on AVX-2 CPUs
     // only: an AVX-512 CPU keeps the ggml dot for it.
+    if (exl3_supported(f.gu_type)) {
+        exl3_gu_rows(exl3_isa(), f, blob, (const float* const*) act, nt, ff, r0, r1);
+        return;
+    }
     if (tq_supported(f.gu_type)) {   // one block decode for all the tokens: a token's bits do not depend on the group
         tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
@@ -321,6 +367,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (exl3_supported(f.d_type)) {
+        exl3_down_rows(exl3_isa(), f, blob, (const float* const*) hq, nt, out, r0, r1);
+        return;
+    }
     if (tq_supported(f.d_type)) {
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
