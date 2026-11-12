@@ -277,6 +277,8 @@ class CheckpointDense:
     `bytes(name)` the stored bytes of a float tensor and `chunks(name, pool)` the streamed bytes of a quantized one.
     `where` and `bytes` are what model_sections.Dense reads."""
 
+    SOURCES = ("BF16",)   # the source dtypes this class reads; a subclass may read more
+
     def __init__(self, ck: Checkpoint, q6k: bool = True, require_complete: bool = True):
         tc = ck.text
         self.ck, self.q6k = ck, q6k
@@ -300,8 +302,8 @@ class CheckpointDense:
             if rule is None:
                 unknown.append(k)
                 continue
-            if dt != "BF16":
-                raise S.ConvertError(f"{k} is {dt}; the dense tensors are read from BF16")
+            if dt not in self.SOURCES:
+                raise S.ConvertError(f"{k} is {dt}; the dense tensors are read from {' or '.join(self.SOURCES)}")
             name = f"blk.{m.group(1)}.{rule[0]}" if m else rule[0]
             ty, how = rule[1], rule[2]
             if how in ("conv", "gconv"):

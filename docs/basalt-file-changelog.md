@@ -29,6 +29,9 @@ download or any re-quantizing.
 - **Added `experts.hadamard`, optional, no version change:** a pack whose experts are Hadamard-folded (`prism.hadamard`
   metadata) names the block, the sign vectors and each layer's folded roles in it, and its `experts.layout` header says
   `hadamard` after the totals. The engine refuses either one without the other.
+- **EXL3 experts, no version change:** a `convert.py --exl3` pack holds experts of types 160 + 2 K (a blob is the
+  checkpoint's three trellises and its six fp16 vectors) under a v5 layout, and may hold an n-gram table of EXL3 rows
+  (type 180 + K) with `per_layer_token_embd.head_bias` beside it. An engine without these types refuses them.
 - **Added `dspark/gguf`, optional, no version change:** a DeepSeek pack's DSpark drafter. The engine ignores sections it
   does not name, so an engine from before it runs such a pack plain, and a pack without it runs plain on any engine.
 - **Trimmed `meta`:** no `sampling` (the server reads the GGUF metadata's `general.sampling.*` keys), no `profile` or

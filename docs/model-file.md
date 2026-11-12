@@ -69,6 +69,22 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 `--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.
 
+## Flash-Next EXL3 pack
+
+`--exl3 DIR` reads an ExLlamaV3 EXL3 checkpoint ([turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3),
+any bitrate branch). The routed experts keep their EXL3 form; the other tensors are computed from theirs and
+stored once in the forms the engine reads. The n-gram table keeps its EXL3 rows (`EXL3R<K>`, with `per_layer_token_embd.head_bias`
+beside it) when the directory holds `ngram_embedding.safetensors`, and is the base pack's otherwise. Metadata, tokenizer, drafter and
+vision come from a base pack of the same model. Each tensor's form: [precision](precision/exl3.md).
+
+```sh
+hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 2.05bpw_h4_ng4 --include "*.safetensors" \
+    --include "*.json" --local-dir exl3
+python3 tools/convert/convert.py --sections-from BASE.basalt --exl3 exl3 --out Qwen3.8-FN-EXL3-2.05.basalt
+```
+
+`--dense-q8-0` stores the projections and shared experts as Q8_0 instead of Q6_K: finer, but more VRAM, so fewer experts fit.
+
 ## Qwen3.8-27B pack
 
 The published pack comes from QUASAR's quantization-aware NVFP4 checkpoint

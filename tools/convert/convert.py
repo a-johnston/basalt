@@ -9,6 +9,8 @@
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--head nvfp4] [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --sections-from BASE.basalt --exl3 DIR --out MODEL.basalt [--dense-q8-0] \\
+        [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -51,6 +53,17 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
   --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
   --head fp8|nvfp4   a BF16 head as FP8 E4M3 rows with an FP32 scale per row (amax / 448, the default) or rounded once
                      to NVFP4 (UE4M3 scale of least squared error per 16 values); a head already NVFP4 is kept
+
+From an EXL3 checkpoint (--sections-from with --exl3)
+  --exl3 DIR         an ExLlamaV3 EXL3 checkpoint of the model (config.json and the model-NNNNN-of-NNNNN shards). The
+                     routed experts keep their trellis words and fp16 scale vectors (tools/convert/exl3_checkpoint.py).
+                     Every other language-model tensor is computed from its EXL3 form in double and stored once in
+                     the form the engine reads: projections and shared experts as Q6_K (Q8_0 where rows are not whole
+                     256-value blocks), output head and token embedding as Q8_0, the rest BF16, F32 or F16 as in the
+                     NVFP4 conversion. The n-gram table is the checkpoint's ngram_embedding.safetensors when DIR holds
+                     it (its rows byte for byte), BASE's otherwise. The GGUF metadata, tokenizer, drafter and vision
+                     sections are BASE's, so BASE must be a pack of the same model.
+  --dense-q8-0       Q8_0 projections and shared experts instead of Q6_K
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -539,6 +552,11 @@ def warn_unofficial():
     print(msg, file=sys.stderr, flush=True)
 
 
+# how the dense projections are quantized, for the packs' metadata
+DENSE_METHODS = {"q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
+                 "q8_0_method": "ggml reference rounding"}
+
+
 def from_checkpoint(a) -> None:
     """The language model straight from an NVFP4 safetensors checkpoint (routed experts moved into Basalt's layout,
     every other tensor converted once from BF16, the n-gram table from FP8, metadata and tokenizer from the
@@ -659,12 +677,164 @@ def from_checkpoint(a) -> None:
                             "weight_scale_2 (FP32); input_scale unused", "repack": "codes and scales unchanged, "
                             "nibbles moved into 64-value blocks", "tail": "fp32 {s_gate, s_up, s_down, 0} per expert"},
                 "dense": {"projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
-                          "q6_k_method": "least-squares 16-value group scales, 8-bit group scales, fp16 super-scale",
-                          "q8_0_method": "ggml reference rounding", "from": "BF16, quantized once",
+                          **DENSE_METHODS, "from": "BF16, quantized once",
                           "transforms": {k: C.METHODS[k] for k in used}},
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
                                   "copied": [n for n in base.names() if n.startswith(("mtp/", "vision/"))]}}
+            job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        w.close()
+        ok = True
+    except S.ConvertError as e:
+        die(str(e))
+    finally:
+        if not ok:
+            try:
+                w.f.close()
+            except OSError:
+                pass
+            partial.unlink(missing_ok=True)
+    os.replace(partial, out)
+    print(f"done: {len(job.rows)} sections, {out.stat().st_size / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
+
+
+def from_exl3(a) -> None:
+    """The language model from an EXL3 checkpoint: the routed experts in EXL3 form, every other tensor converted once
+    to the forms the engine reads, the n-gram table's rows byte for byte when the checkpoint has its file (BASE's
+    table otherwise); the GGUF metadata, tokenizer, drafter and vision are copied from BASE."""
+    import multiprocessing
+    import checkpoint as C
+    import exl3_checkpoint as E
+    out, src = Path(a.out), Path(a.sections_from)
+    partial = Path(str(out) + ".partial")
+    if out.exists() and not a.force:
+        die(f"{out} exists (use --force to overwrite)")
+    if not src.is_file():
+        die(f"missing input: {src}")
+    base = ModelFile(str(src))
+    base_meta = json.loads(base.read("meta"))
+    q6k = not a.dense_q8_0
+    try:
+        ck = E.Exl3Checkpoint(a.exl3)
+        experts = E.Exl3Experts(ck)
+        dense_src = E.Exl3Dense(ck, q6k)
+        dense = S.Dense(dense_src, False)
+    except S.ConvertError as e:
+        die(str(e))
+    old = base.read("experts.layout").decode("utf-8").splitlines()
+    m = re.search(r"\(n_expert (\d+)", old[0])
+    n_layers = sum(1 for x in old if x.strip() and not x.startswith("#"))
+    if not m or int(m.group(1)) != experts.n_expert or n_layers != experts.n_layers:
+        die(f"{src} has {n_layers} layers of {m.group(1) if m else '?'} experts, the checkpoint {experts.n_layers} "
+            f"of {experts.n_expert}")
+    kv = dict(base_meta.get("gguf_kv", {}))
+    arch = kv.get("general.architecture", "")
+    if (kv.get(arch + ".embedding_length"), kv.get(arch + ".expert_feed_forward_length")) != (experts.h, experts.ff):
+        die(f"{src}'s experts are not {experts.h} x {experts.ff}")
+    # BASE's metadata describes this model only if every tensor agrees in shape
+    base_tensors = base_meta.get("tensors", {})
+    if E.NGRAM_NAME not in base_tensors:
+        die(f"{src} has no {E.NGRAM_NAME}")
+    for n, t in dense_src.tensors.items():
+        bt = base_tensors.get(n)
+        if bt is None or [int(d) for d in bt["shape"] if int(d) > 1] != [int(d) for d in t.ne if int(d) > 1]:
+            die(f"{n}: the checkpoint's is {list(t.ne)}, {src}'s {bt['shape'] if bt else 'missing'}")
+    extra = set(base_tensors) - set(dense_src.tensors) - {E.NGRAM_NAME, E.NGRAM_BIAS_NAME}
+    if extra:
+        die(f"{src} has tensors the checkpoint does not: " + ", ".join(sorted(extra)[:8]))
+    ngram = None
+    if (ck.dir / E.NGRAM_FILE).is_file():
+        try:
+            ngram = E.NgramTable(ck.dir / E.NGRAM_FILE, kv, int(base_tensors[E.NGRAM_NAME]["shape"][1]))
+        except S.ConvertError as e:
+            die(str(e))
+    if partial.exists():
+        partial.unlink()
+    w = ModelWriter(str(partial))
+    job = Job(w)
+    replaced = ("experts", "experts.layout", "experts.hadamard", "meta", "dense", "dense.index", "gguf", "hc8")
+    copied = [n for n in base.names() if n not in replaced]
+    ok = False
+    try:
+        with multiprocessing.Pool(a.workers) as pool:
+            print("writing sections:", flush=True)
+            for name in base.names():   # in BASE's order, so hc8 follows the dense sections it is computed from
+                if name == "experts":
+                    job.chunks("experts", experts.chunks(pool))
+                    job.bytes("experts.layout", experts.layout_text())
+                elif name == "dense":
+                    job.chunks("dense", dense.chunks())
+                    job.bytes("dense.index", dense.index_text())
+                elif name == "gguf":
+                    t = time.time()
+                    parts, names = [], list(dense_src.tensors)
+                    for n, info in dense_src.tensors.items():
+                        if info.type_name in ("Q8_0", "Q6_K"):
+                            parts.append(Stream(info.expected_bytes(), dense_src.chunks(n, pool)))
+                        else:
+                            parts.append(dense_src.bytes(n).tobytes())
+                    if ngram is not None:
+                        parts += [ngram.bias, ngram.part()]
+                        names += [E.NGRAM_BIAS_NAME, E.NGRAM_NAME]
+                    else:   # BASE's table, with its head biases if it has them
+                        for n in (E.NGRAM_BIAS_NAME, E.NGRAM_NAME):
+                            if n in base_tensors:
+                                parts.append((str(src), base.section("gguf")[0] + int(base_tensors[n]["offset"]),
+                                              int(base_tensors[n]["bytes"])))
+                                names.append(n)
+                    offs = dict(zip(names, w.add_parts("gguf", parts, TENSOR_ALIGN)))
+                    job._report("gguf", w.entries[-1][2], time.time() - t)
+                elif name == "hc8":
+                    job.hc8()
+                elif name not in replaced:
+                    off, size = base.section(name)
+                    job.file(name, src, off, size)
+            if w.entries[[e[0] for e in w.entries].index("experts")][2] != experts.total:
+                die("the experts section is not the size its layout says")
+            for name, _, _, digest in w.entries:
+                if name in copied and digest != base.sections[name][2]:
+                    die(f"section {name}: the copy's SHA-256 differs from {src}'s")
+            tensors = {n: {"type": i.type_name, "type_id": i.type_id, "shape": [int(d) for d in i.ne],
+                           "bytes": i.expected_bytes(), "offset": offs[n]} for n, i in dense_src.tensors.items()}
+            if ngram is not None:
+                tensors[E.NGRAM_BIAS_NAME] = {"type": "F16", "type_id": 1, "shape": ngram.bias_shape,
+                                              "bytes": len(ngram.bias), "offset": offs[E.NGRAM_BIAS_NAME]}
+                tensors[E.NGRAM_NAME] = {"type": ngram.type_name, "type_id": ngram.type_id,
+                                         "shape": [base_tensors[E.NGRAM_NAME]["shape"][0], ngram.rows],
+                                         "bytes": ngram.nbytes, "offset": offs[E.NGRAM_NAME]}
+            else:
+                for n in (E.NGRAM_BIAS_NAME, E.NGRAM_NAME):
+                    if n in base_tensors:
+                        tensors[n] = {**base_tensors[n], "offset": offs[n]}
+            kv["general.file_type"] = 18 if q6k else 7
+            if a.name:
+                kv["general.name"] = a.name
+            meta = {k: v for k, v in base_meta.items() if k not in ("checkpoint", "exl3", "sections_from")}
+            meta["name"] = a.name or f"Qwen3.8-Flash-Next EXL3 {ck.quant.get('bits', '?')}bpw"
+            meta["sources"] = [{"path": p.name, "size": p.stat().st_size,
+                                "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)}
+                               for p in ck.shards + ([ngram.path] if ngram is not None else [])]
+            meta["gguf_kv"] = kv
+            meta["tensors"] = tensors
+            meta["conversions"] = {"compat_bf16": False, "tensors": []}
+            meta["exl3"] = {
+                "dir": Path(a.exl3).name,
+                "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
+                "quantization_config": {k: v for k, v in ck.quant.items() if not isinstance(v, (dict, list))},
+                "experts": {"format": "exl3 mul1", "source": "trellis (int16 tiles), suh, svh (fp16)",
+                            "repack": "trellis words unchanged, tiles reordered output-major; vectors unchanged",
+                            "bits_per_weight_gate_up/down": experts.bitrates()},
+                "dense": {"from": "the EXL3 weight diag(suh) H inner H diag(svh) in double, stored once",
+                          "stored <- source": dense_src.source_types(),
+                          "projections": "Q6_K where rows are whole 256-value blocks, else Q8_0" if q6k else "Q8_0",
+                          **DENSE_METHODS,
+                          "rounded_to_bf16": {"tensors": len(dense_src.rounded), "values": sum(dense_src.rounded.values())},
+                          "transforms": {k: C.METHODS[k] for k in sorted({t.how for t in dense_src.tensors.values()})}},
+                "n_gram_table": (f"{E.NGRAM_FILE}'s rows byte for byte ({ngram.k} bits per value) and head_bias"
+                                 if ngram is not None else f"{src.name}'s {base_tensors[E.NGRAM_NAME]['type']} table"),
+                "sections_from": {"path": src.name, "size": src.stat().st_size,
+                                  "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
+                                  "copied": copied + ["gguf_kv"]}}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
         ok = True
@@ -785,10 +955,12 @@ def main():
                     help="an NVFP4 safetensors checkpoint: with --sections-from, the language model is read from it; "
                          "with --requant-dense-q6k, the BF16 projections")
     ap.add_argument("--dense-q8-0", action="store_true",
-                    help="with --checkpoint and --sections-from: Q8_0 projections instead of Q6_K")
+                    help="with --sections-from and --checkpoint or --exl3: Q8_0 projections instead of Q6_K")
     ap.add_argument("--stream-shards", action="store_true",
                     help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
-    ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
+    ap.add_argument("--exl3", metavar="DIR",
+                    help="an EXL3 checkpoint: with --sections-from, the language model is read from it")
+    ap.add_argument("--workers", type=int, default=16, help="with --checkpoint or --exl3: converter processes")
     ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
                     "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
     ap.add_argument("--head", choices=("fp8", "nvfp4"),
@@ -812,6 +984,14 @@ def main():
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
+    if a.exl3:
+        if not a.sections_from or a.checkpoint or a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab \
+                or a.compat_bf16 or a.no_vision or a.stream_shards or a.drafter or a.head:
+            ap.error("--exl3 takes --sections-from, --out, --dense-q8-0, --name, --workers and --force")
+        if not Path(a.exl3).is_dir():
+            ap.error(f"missing input: {a.exl3}")
+        from_exl3(a)
+        return
     if a.sections_from and a.checkpoint:
         if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
@@ -832,8 +1012,10 @@ def main():
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return
-    if a.dense_q8_0 or a.stream_shards:
-        ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")
+    if a.dense_q8_0:
+        ap.error("--dense-q8-0 needs --sections-from with --checkpoint or --exl3")
+    if a.stream_shards:
+        ap.error("--stream-shards needs --checkpoint and --sections-from")
     if not a.gguf:
         ap.error("--gguf is required")
     if not Path(a.gguf[0]).is_file():
