@@ -347,6 +347,8 @@ class CheckpointDense:
     `bytes(name)` the stored bytes of a float tensor and `chunks(name, pool)` the streamed bytes of a quantized one.
     `where` and `bytes` are what model_sections.Dense reads."""
 
+    SOURCES = ()   # source dtypes a subclass reads itself (its own jobs and chunks), beside the ones `_source` knows
+
     def __init__(self, ck: Checkpoint, q6k: bool = True, require_complete: bool = True):
         tc = ck.text
         self.ck, self.q6k = ck, q6k
@@ -399,7 +401,9 @@ class CheckpointDense:
 
     def _source(self, name, dt, shape, f32=False):
         """How a checkpoint tensor stores its values, and that in words: (qsrc or None, description). F32 is read only
-        for a tensor the pack stores as F32 (`f32`)."""
+        for a tensor the pack stores as F32 (`f32`), or any type in a subclass's SOURCES."""
+        if dt in self.SOURCES:
+            return None, dt.lower()
         if dt == "BF16":
             return None, "bf16"
         if dt == "F32" and f32:
