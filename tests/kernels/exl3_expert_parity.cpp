@@ -1,7 +1,8 @@
-// tests/kernels/exl3_expert_parity.cpp - the EXL3 experts (exl3_cpu.hpp) on the CPU.
+// tests/kernels/exl3_expert_parity.cpp - the EXL3 experts (exl3_cpu.hpp), every path.
 //
 //     build/exl3_expert_parity                 random blobs at the model's geometry, every bitrate
 //     build/exl3_expert_parity --cpu-bench     the CPU rows per ISA on one core: us per expert and GB/s
+//     build/exl3_expert_parity --bench         the grouped decode kernels and the dequantizer: us per call, GB/s
 //     build/exl3_expert_parity --io BLOB GU D OUT   one real expert blob (types GU / D) on fixed inputs: writes
 //                                              x (NT x H floats) then y (NT x H floats) to OUT, for a comparison
 //                                              with ExLlamaV3 (tools/convert/exl3_upstream_check.py --expert-io)
@@ -11,10 +12,18 @@
 // (c) the CPU path (native_quant_act / native_gu_rows / native_quant_h / native_down_rows): within a tolerance of
 // (b) (int16 activations, the codebook before its fp16 rounding), every ISA bit for bit, a token alone against the
 // same token in a group bit for bit, row ranges against the whole bit for bit.
+// (d) the GPU path (native_expert_act_rows / native_expert_grouped: the fp16 codebook values, hi + lo fp16
+// activations on the tensor cores) against (b); an entry alone against the same entry in a call of several groups,
+// and one block row striding over the groups, bit for bit.  (e) the prompt path's dequantizer against the
+// original-basis weights in double.
 #include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
+
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <cmath>
@@ -143,6 +152,203 @@ void inputs(std::vector<float>& x, int nt, std::mt19937& rng) {
     for (auto& v : x) v = nd(rng);
     // a dominant component, as hidden states have: its Hadamard block is far larger than the others
     for (int t = 0; t < nt; ++t) x[(size_t) t * H + 700] = 60.f + (float) t;
+}
+
+#define CK(x) do { if ((x) != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", #x, cudaGetErrorString(cudaGetLastError())); std::exit(1); } } while (0)
+
+// device buffers for `groups` blobs and `cap` entries of up to `nt` tokens
+struct Gpu {
+    cpu::NativeFmt f;
+    k::NativeExpertLayout L;
+    int groups = 0, cap = 0;
+    uint8_t* blobs = nullptr;
+    void *act = nullptr, *scr = nullptr;
+    float *x = nullptr, *out = nullptr;
+    uint16_t *dq_gu = nullptr, *dq_d = nullptr;
+    unsigned long long* ptr = nullptr;
+    int32_t *start = nullptr, *count = nullptr, *dst = nullptr, *tok = nullptr;
+    Gpu(const cpu::NativeFmt& fmt, int groups_, int cap_, int nt) : f(fmt), groups(groups_), cap(cap_) {
+        L = k::native_expert_layout(f);
+        CK(cudaMalloc(&blobs, f.bytes * groups));
+        CK(cudaMalloc(&x, (size_t) nt * H * 4));
+        CK(cudaMalloc(&act, (size_t) nt * k::native_expert_act_bytes(f)));
+        CK(cudaMalloc(&scr, k::native_expert_scratch_bytes(L, cap)));
+        CK(cudaMalloc(&out, (size_t) cap * H * 4));
+        CK(cudaMalloc(&dq_gu, (size_t) 2 * FF * H * 2));
+        CK(cudaMalloc(&dq_d, (size_t) FF * H * 2));
+        CK(cudaMalloc(&ptr, (size_t) groups * 8));
+        CK(cudaMalloc(&start, (size_t) (groups + 1) * 4));
+        CK(cudaMalloc(&count, 4));
+        CK(cudaMalloc(&dst, (size_t) cap * 4));
+        CK(cudaMalloc(&tok, (size_t) cap * 4));
+    }
+    ~Gpu() {
+        for (void* p : {(void*) blobs, act, scr, (void*) x, (void*) out, (void*) dq_gu, (void*) dq_d, (void*) ptr,
+                        (void*) start, (void*) count, (void*) dst, (void*) tok})
+            cudaFree(p);
+    }
+    // groups given as (blob index, its entries' tokens); the result row of entry i is i
+    void run(const std::vector<std::pair<int, std::vector<int>>>& g, const float* xh, int nt, std::vector<float>& res,
+             int64_t grid_groups, cudaStream_t s) {
+        std::vector<unsigned long long> hp;
+        std::vector<int32_t> hs, hd, ht;
+        for (const auto& [b, toks] : g) {
+            hp.push_back((unsigned long long) (blobs + f.bytes * b));
+            hs.push_back((int32_t) ht.size());
+            for (const int t : toks) { hd.push_back((int32_t) ht.size()); ht.push_back(t); }
+        }
+        hs.push_back((int32_t) ht.size());
+        const int32_t ng = (int32_t) g.size();
+        CK(cudaMemcpy(ptr, hp.data(), hp.size() * 8, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(start, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(count, &ng, 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dst, hd.data(), hd.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(tok, ht.data(), ht.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(x, xh, (size_t) nt * H * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemset(out, 0, (size_t) cap * H * 4));
+        k::native_expert_act_rows(f, x, nt, act, s);
+        k::native_expert_grouped(L, ptr, start, count, dst, tok, groups, cap, act, scr, out, s, grid_groups);
+        res.resize(ht.size() * H);
+        CK(cudaMemcpyAsync(res.data(), out, res.size() * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+    }
+};
+
+// W = diag(suh) H inner H diag(svh) in double, w[r * n_in + k] (row r = output)
+std::vector<double> weight_d(const std::vector<float>& inner, const uint8_t* suh, const uint8_t* svh, int n_in, int n_out) {
+    std::vector<double> w(inner.begin(), inner.end()), col((size_t) n_out);
+    for (int r = 0; r < n_out; ++r) {
+        hadamard_d(w.data() + (size_t) r * n_in, n_in);
+        for (int i = 0; i < n_in; ++i) w[(size_t) r * n_in + i] *= get_f16(suh, i);
+    }
+    for (int i = 0; i < n_in; ++i) {
+        for (int r = 0; r < n_out; ++r) col[(size_t) r] = w[(size_t) r * n_in + i];
+        hadamard_d(col.data(), n_out);
+        for (int r = 0; r < n_out; ++r) w[(size_t) r * n_in + i] = col[(size_t) r] * get_f16(svh, r);
+    }
+    return w;
+}
+
+int gpu_parity(int k2, cudaStream_t s) {
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(cpu::kExl3TypeBase + k2, cpu::kExl3TypeBase + k2, H, FF, f, err)) return 1;
+    if (!k::native_expert_supported(f.gu_type, f.d_type, H, FF)) { std::printf("  gpu: %.1f bpw not supported\n", k2 / 2.0); return 1; }
+    int failures = 0;
+    std::mt19937 rng(200 + (unsigned) k2);
+    std::vector<uint8_t> blob[2] = {std::vector<uint8_t>(f.bytes), std::vector<uint8_t>(f.bytes)};
+    Gpu g(f, 2, 8, NT);
+    Ref ref[2];
+    for (int b = 0; b < 2; ++b) {
+        random_blob(f, blob[b].data(), rng);
+        ref[b].decode(f, blob[b].data());
+        CK(cudaMemcpy(g.blobs + f.bytes * b, blob[b].data(), f.bytes, cudaMemcpyHostToDevice));
+    }
+    std::vector<float> x;
+    inputs(x, NT, rng);
+    // five entries of one expert (a pass of four and one of one) and three of another (two and one)
+    const std::vector<std::pair<int, std::vector<int>>> plan = {{0, {0, 1, 2, 0, 1}}, {1, {2, 0, 1}}};
+    std::vector<double> want;
+    for (const auto& [b, toks] : plan)
+        for (const int t : toks) {
+            want.resize(want.size() + H);
+            ref[b].run(f, blob[b].data(), x.data() + (size_t) t * H, want.data() + want.size() - H);
+        }
+    std::vector<float> got, one, strided;
+    g.run(plan, x.data(), NT, got, 0, s);
+    const Err e = err_of(got, want);
+    const bool ok = e.rel < 1e-4;
+    std::printf("  gpu grouped vs double reference: max abs %.3e rel %.3e %s\n", e.max_abs, e.rel, ok ? "ok" : "FAIL");
+    failures += !ok;
+    g.run(plan, x.data(), NT, strided, 1, s);
+    if (std::memcmp(strided.data(), got.data(), got.size() * 4) != 0) { std::printf("  gpu one block row striding over the groups: DIFFER\n"); ++failures; }
+    size_t at = 0;
+    for (const auto& [b, toks] : plan)
+        for (const int t : toks) {
+            g.run({{b, {t}}}, x.data(), NT, one, 0, s);
+            if (std::memcmp(one.data(), got.data() + at, (size_t) H * 4) != 0) {
+                std::printf("  gpu entry (blob %d, token %d) alone vs in the call: DIFFER\n", b, t);
+                ++failures;
+            }
+            at += H;
+        }
+    // the prompt path's dequantizer: the original-basis weights, rounded once to fp16
+    {
+        const uint8_t* v = blob[0].data() + f.bytes - f.tail;
+        k::exl3_dequant_gu_f16(g.L, g.blobs, g.dq_gu, s);
+        k::exl3_dequant_down_f16(g.L, g.blobs, g.dq_d, s);
+        std::vector<uint16_t> gu((size_t) 2 * FF * H), dn((size_t) FF * H);
+        CK(cudaMemcpyAsync(gu.data(), g.dq_gu, gu.size() * 2, cudaMemcpyDeviceToHost, s));
+        CK(cudaMemcpyAsync(dn.data(), g.dq_d, dn.size() * 2, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        const std::vector<double> wg = weight_d(ref[0].g, v, v + 2 * H, H, FF);
+        const std::vector<double> wu = weight_d(ref[0].u, v + 2 * (H + FF), v + 2 * (2 * H + FF), H, FF);
+        const std::vector<double> wd = weight_d(ref[0].d, v + 4 * (H + FF), v + 4 * (H + FF) + 2 * FF, FF, H);
+        // within an fp16 rounding of the double value (the float transforms add a little)
+        size_t bad = 0;
+        double worst = 0;
+        auto cmp = [&](uint16_t bits, double w) {
+            const double d = std::fabs((double) k::f32_from_f16(bits) - w), ulp = std::ldexp(1.0, std::max(-14, std::ilogb(std::fabs(w) + 1e-30)) - 10);
+            worst = std::max(worst, d / ulp);
+            bad += d > 0.52 * ulp + 1e-7;
+        };
+        for (int r = 0; r < FF; ++r)
+            for (int i = 0; i < H; ++i) {
+                cmp(gu[(size_t) (2 * r) * H + i], wg[(size_t) r * H + i]);
+                cmp(gu[(size_t) (2 * r + 1) * H + i], wu[(size_t) r * H + i]);
+            }
+        for (int r = 0; r < H; ++r)
+            for (int i = 0; i < FF; ++i) cmp(dn[(size_t) r * FF + i], wd[(size_t) r * FF + i]);
+        std::printf("  gpu fp16 dequantizer vs the weights in double: worst %.3f ulp, %zu of %d beyond an fp16 rounding %s\n", worst,
+                    bad, 3 * H * FF, bad ? "FAIL" : "ok");
+        failures += bad != 0;
+    }
+    return failures;
+}
+
+// the grouped decode kernels as the verify window runs them: `groups` experts of `per` entries each, distinct blobs
+void gpu_bench(int k2, int groups, int per, cudaStream_t s) {
+    cpu::NativeFmt f;
+    std::string err;
+    cpu::native_fmt(cpu::kExl3TypeBase + k2, cpu::kExl3TypeBase + k2, H, FF, f, err);
+    const int ne = groups * per;
+    Gpu g(f, groups, ne, per);
+    std::mt19937 rng(3);
+    std::vector<uint8_t> blob(f.bytes);
+    std::vector<std::pair<int, std::vector<int>>> plan;
+    for (int e = 0; e < groups; ++e) {
+        random_blob(f, blob.data(), rng);
+        CK(cudaMemcpy(g.blobs + f.bytes * e, blob.data(), f.bytes, cudaMemcpyHostToDevice));
+        plan.push_back({e, {}});
+        for (int i = 0; i < per; ++i) plan.back().second.push_back(i);
+    }
+    std::vector<float> x, res;
+    inputs(x, per, rng);
+    g.run(plan, x.data(), per, res, 0, s);
+    auto run = [&] {
+        k::native_expert_act_rows(f, g.x, per, g.act, s);
+        k::native_expert_grouped(g.L, g.ptr, g.start, g.count, g.dst, g.tok, groups, ne, g.act, g.scr, g.out, s);
+    };
+    for (int i = 0; i < 20; ++i) run();
+    CK(cudaStreamSynchronize(s));
+    const int it = 200;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < it; ++i) run();
+    CK(cudaStreamSynchronize(s));
+    double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+    std::printf("bench %.1f bpw: %d groups x %d entries: %.1f us per call, %.0f GB/s of weights\n", k2 / 2.0, groups, per, us,
+                (double) f.bytes * groups / (us * 1e3));
+    if (groups == 1 && per == 1) {
+        t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; ++i) {
+            k::exl3_dequant_gu_f16(g.L, g.blobs, g.dq_gu, s);
+            k::exl3_dequant_down_f16(g.L, g.blobs, g.dq_d, s);
+        }
+        CK(cudaStreamSynchronize(s));
+        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
+        std::printf("bench %.1f bpw: fp16 dequantizer %.1f us per expert, %.1f GB/s of fp16 written\n", k2 / 2.0, us,
+                    3.0 * H * FF * 2 / (us * 1e3));
+    }
 }
 
 int decoder_checks() {
@@ -304,8 +510,18 @@ int main(int argc, char** argv) {
                     for (const int nt : {1, 4}) cpu_bench(k2, isa, nt);
         return 0;
     }
+    cudaStream_t s;
+    CK(cudaStreamCreate(&s));
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+        for (const int k2 : {3, 4, 8})
+            for (const auto& [groups, per] : {std::pair<int, int>{1, 1}, {10, 1}, {30, 1}, {10, 4}, {40, 2}}) gpu_bench(k2, groups, per, s);
+        return 0;
+    }
     int failures = decoder_checks();
-    for (const int k2 : kRates) failures += parity(k2);
+    for (const int k2 : kRates) {
+        failures += parity(k2);
+        failures += gpu_parity(k2, s);
+    }
     std::printf("%s\n", failures ? "FAILED" : "PASS");
     return failures ? 1 : 0;
 }

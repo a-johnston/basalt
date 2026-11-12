@@ -244,10 +244,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         plan_ = b.take<int32_t>((uint64_t) plan_i32_ + 16);
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * basalt::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+        uint64_t nat_act = (N / 32) * 36, nat_scratch = basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff);
+        for (const auto& f : basalt::kernels::cpu::expert_layout().fmt) {   // the EXL3 types need more of both
+            nat_act = std::max<uint64_t>(nat_act, basalt::kernels::native_expert_act_bytes(f));
+            nat_scratch = std::max<uint64_t>(nat_scratch, basalt::kernels::native_expert_scratch_bytes(
+                basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) (T * K)));
+        }
+        nat_xq_ = b.take<uint8_t>(T * nat_act);
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff), nat_scratch));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
