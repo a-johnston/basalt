@@ -5,6 +5,8 @@
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d; MIT, Copyright (c) 2023-2026 The ggml authors, see
 // THIRD_PARTY_LICENSES).  The block structs and codebook grids are basalt/ggml/ggml_common.h.
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/dp4a.hpp"
 #include "basalt/kernels/packed_byte.hpp"
@@ -3557,7 +3559,20 @@ const float* native_expert_gu_signs(const cpu::NativeFmt& f) {
     return f.had_gu ? hadamard_device_signs(f.gu_signs, (int) f.n_embd) : nullptr;
 }
 
+size_t native_expert_act_bytes(const cpu::NativeFmt& f) {
+    if (cpu::exl3_supported(f.gu_type)) return exl3_act_bytes(f.n_embd);
+    return (size_t) (f.n_embd / 32) * sizeof(block_q8_1);
+}
+
+void native_expert_act_rows(const cpu::NativeFmt& f, const float* x, int64_t rows, void* y, void* stream) {
+    if (cpu::exl3_supported(f.gu_type)) exl3_copy_rows(x, (float*) y, rows * f.n_embd, stream);
+    else if (f.had_gu) hadamard_q8_1_rows(x, rows, f.n_embd, f.had_block, native_expert_gu_signs(f), y, stream);
+    else quantize_q8_1_rows(x, rows, f.n_embd, y, stream);
+}
+
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) noexcept {
+    if (cpu::exl3_supported(gu_type) || cpu::exl3_supported(d_type))
+        return (up_type < 0 || up_type == gu_type) && exl3_expert_supported(gu_type, d_type, n_embd, n_ff);
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     bool mix = up_type < 0 || up_type == gu_type;
     switch (gu_type * 100 + up_type) {
@@ -3572,6 +3587,7 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit,
                                         int up_type) {
+    if (cpu::exl3_supported(gu_type)) return exl3_expert_layout(gu_type, d_type, n_embd, n_ff);
     NativeExpertLayout L;
     L.swiglu_limit = swiglu_limit;
     L.gu_type = gu_type;
@@ -3586,6 +3602,11 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row + (gu_type == 40 ? kNvfp4Tail : 0);   // NVFP4's scale tail
     return L;
+}
+
+size_t native_expert_scratch_bytes(const NativeExpertLayout& L, int64_t cap) {
+    if (cpu::exl3_supported(L.gu_type)) return exl3_expert_scratch_bytes(cap, L.n_embd, L.n_ff);
+    return native_expert_scratch_bytes(cap, L.n_ff);
 }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
@@ -3638,6 +3659,11 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
                   int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                   int64_t grid_groups, [[maybe_unused]] float limit) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (cpu::exl3_supported(L.gu_type)) {   // the activations are the tokens' float rows (native_expert_act_rows)
+        exl3_expert_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, (const float*) x_q8_1,
+                            scratch, out, stream, grid_groups);
+        return;
+    }
     if (L.n_ff % 32 != 0) { basalt::log::error("basalt", "native_expert_grouped: n_ff %lld", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;

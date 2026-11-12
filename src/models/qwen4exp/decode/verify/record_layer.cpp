@@ -403,11 +403,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     }
     if (dm) {}   // the route kernel wrote nat_xq_
     else if (basalt::kernels::cpu::expert_layout().native) {
-        const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
-        if (f.had_gu)
-            hadamard_q8_1_rows(xm, n, N, f.had_block, native_expert_gu_signs(f), v_.nat_xq_, cs);
-        else
-            quantize_q8_1_rows(xm, n, N, v_.nat_xq_, cs);
+        native_expert_act_rows(basalt::kernels::cpu::expert_layout().fmt[(size_t) l], xm, n, v_.nat_xq_, cs);
     }
     else
         quantize_q8_0_scaled(xm, v_.hit_xq_, v_.hit_xs_, (int64_t) n * N, cs);

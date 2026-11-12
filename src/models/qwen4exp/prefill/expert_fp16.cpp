@@ -2,6 +2,8 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/prefill/gemm.hpp"
 #include "basalt/prefill/moe_fp4.hpp"
@@ -16,12 +18,19 @@ bool Prefill::Run::Chunk::Experts::Group::compute_fp16(size_t j, const uint8_t* 
     if (lay.native) {
         // a native pack's layer, dequantized by llama.cpp's own formulas
         const auto& f = lay.fmt[(size_t) l];
-        // NVFP4: the tail's FP32 scales {s_gate, s_up, s_down} go into the fp16 weights
-        const float* tail = f.tail ? (const float*) (blob_dev + f.bytes - f.tail) : nullptr;
-        basalt::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                           m.dq_gu[q], m.cs, tail, f.up_type);
-        basalt::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
-                                        tail ? tail + 2 : nullptr);
+        if (basalt::kernels::cpu::exl3_supported(f.gu_type)) {
+            // EXL3: both transforms and the scale vectors go into the fp16 weights, so the inputs stay as they are
+            const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            basalt::kernels::exl3_dequant_gu_f16(L, blob_dev, m.dq_gu[q], m.cs);
+            basalt::kernels::exl3_dequant_down_f16(L, blob_dev, m.dq_d[q], m.cs);
+        } else {
+            // NVFP4: the tail's FP32 scales {s_gate, s_up, s_down} go into the fp16 weights
+            const float* tail = f.tail ? (const float*) (blob_dev + f.bytes - f.tail) : nullptr;
+            basalt::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                               m.dq_gu[q], m.cs, tail, f.up_type);
+            basalt::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
+                                            tail ? tail + 2 : nullptr);
+        }
     } else {
         blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
     }

@@ -248,10 +248,9 @@ private:
     /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
     bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
               std::string& err);
-    /// `gu_block` > 0: the gate/up are Hadamard-folded, so x is rotated in blocks of it (device signs `gu_signs`) as it is
-    /// quantized.
-    bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err, float* out, int gu_block, const float* gu_signs);
+    /// `f`: the layer's format; native_expert_act_rows prepares x in the form its grouped kernels read.
+    bool launch_layout(int64_t layer, const kernels::cpu::NativeFmt& f, const float* x, const int32_t* ids, int64_t n_tok,
+                       int64_t k, const int32_t* kind, std::string& err, float* out);
 };
 
 }  // namespace basalt::core

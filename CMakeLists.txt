@@ -446,6 +446,7 @@ add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/dense_ops.cu
                         src/kernels/cuda/gqa_attn.cu
                         src/kernels/cuda/nvfp4_planes.cu
+                        src/kernels/cuda/exl3_kernels.cu
                         src/ngram/ple_reader.cpp)
 target_link_libraries(kernels PUBLIC core artifact)
 if(BASALT_MODEL_QWEN4EXP)
@@ -1770,11 +1771,12 @@ if(BUILD_TESTING)
   target_link_libraries(tq_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
   basalt_gpu_test(NAME tq_expert_parity COMMAND tq_expert_parity)
   set_tests_properties(tq_expert_parity PROPERTIES TIMEOUT 300)
-  # the EXL3 experts: the decoder against the converter's reference, the CPU path against a double reference
-  # (--cpu-bench: timings)
+  # the EXL3 experts: the decoder against the converter's reference, the CPU and GPU paths against a double reference
+  # (--cpu-bench, --bench: timings)
   add_executable(exl3_expert_parity tests/kernels/exl3_expert_parity.cpp)
-  target_link_libraries(exl3_expert_parity PRIVATE kernels_cpu)
-  basalt_cpu_test(NAME exl3_expert_parity COMMAND exl3_expert_parity)
+  target_include_directories(exl3_expert_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(exl3_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+  basalt_gpu_test(NAME exl3_expert_parity COMMAND exl3_expert_parity)
   set_tests_properties(exl3_expert_parity PROPERTIES TIMEOUT 300)
   if(BASALT_MODEL_QWEN4EXP)
   # the PCIe share's staging copy (fetch_blobs, rebase_ptrs) byte for byte (--bench: GB/s)

@@ -117,8 +117,25 @@ namespace {
 
 size_t g_min_scratch = 0;
 
+// the scratch of the widest layer (the EXL3 types need more than the q8_1 formats)
 size_t scratch_bytes(int64_t n_ff) {
-    return std::max<size_t>(g_min_scratch, basalt::kernels::native_expert_scratch_bytes(CAP, n_ff));
+    size_t b = std::max<size_t>(g_min_scratch, basalt::kernels::native_expert_scratch_bytes(CAP, n_ff));
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    if (lay.native)
+        for (const auto& f : lay.fmt)
+            b = std::max(b, basalt::kernels::native_expert_scratch_bytes(
+                                basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit,
+                                                                      f.up_type), CAP));
+    return b;
+}
+
+// one token's activation in the widest form a layer's grouped experts read
+size_t act_bytes(int64_t n_embd) {
+    size_t b = (size_t) (n_embd / 32) * 36;
+    const auto& lay = basalt::kernels::cpu::expert_layout();
+    if (lay.native)
+        for (const auto& f : lay.fmt) b = std::max(b, basalt::kernels::native_expert_act_bytes(f));
+    return b;
 }
 
 }  // namespace
@@ -127,7 +144,7 @@ void PeerExperts::set_min_scratch(size_t bytes) { g_min_scratch = bytes; }
 
 uint64_t PeerExperts::device_overhead_bytes(int64_t n_embd, int64_t n_ff) {
     return (uint64_t) scratch_bytes(n_ff) + (uint64_t) CAP * n_embd * sizeof(float) * 2 + sizeof(Meta) +
-           (uint64_t) CAP * (n_embd / 32) * 36;
+           (uint64_t) CAP * act_bytes(n_embd);
 }
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
@@ -190,7 +207,7 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
         ck(cudaMalloc((void**) &d_x_, (size_t) CAP * n_embd * sizeof(float)), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * n_embd * sizeof(float)), "result", err) &&
         ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (n_embd / 32) * 36), "activations", err) &&
+        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * act_bytes(n_embd)), "activations", err) &&
         ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
     return true;
@@ -346,9 +363,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         err = "peer experts: only native packs are supported";
         return false;
     }
-    const auto& f = lay.fmt[(size_t) layer];
-    return launch_layout(layer, basalt::kernels::native_expert_layout(f), x, ids, n_tok, k, kind, err, out,
-                         f.had_gu ? f.had_block : 0, basalt::kernels::native_expert_gu_signs(f));
+    return launch_layout(layer, lay.fmt[(size_t) layer], x, ids, n_tok, k, kind, err, out);
 }
 
 bool PeerExperts::plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups,
@@ -533,9 +548,8 @@ bool PeerExperts::run_fetched(std::string& err) {
     return true;
 }
 
-bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
-                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err, float* out,
-                                int gu_block, const float* gu_signs) {
+bool PeerExperts::launch_layout(int64_t layer, const kernels::cpu::NativeFmt& f, const float* x, const int32_t* ids,
+                                int64_t n_tok, int64_t k, const int32_t* kind, std::string& err, float* out) {
     const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_rows_ = 0;
@@ -550,8 +564,8 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
     if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
-    if (gu_block > 0) basalt::kernels::hadamard_q8_1_rows(d_x_, n_tok, n_embd_, gu_block, gu_signs, d_q8_, s);
-    else basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+    basalt::kernels::native_expert_act_rows(f, d_x_, n_tok, d_q8_, s);
+    const auto L = basalt::kernels::native_expert_layout(f);
     Meta* dm = (Meta*) d_meta_;
     basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
     basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
