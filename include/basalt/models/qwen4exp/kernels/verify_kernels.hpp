@@ -14,6 +14,7 @@
 // Everything that varies per window (token ids, `n_keep`) is read from DEVICE memory so the kernels can be captured.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "basalt/kernels/gdn_window.hpp"
