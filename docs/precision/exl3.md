@@ -40,3 +40,11 @@ expert's output.
 
 On three experts of the 2.05 bpw Flash-Next quant, the CPU path is within 9.2e-4 of ExLlamaV3's reconstructed weights
 applied in double; ExLlamaV3's own kernels on fp16 inputs are within 1.2e-3 of the same.
+
+## The n-gram table
+
+The engine decodes an n-gram row on the CPU as `fp16 codebook value * scale + bias` in fp32 (`exl3_ring_dequant_row`
+in `models/qwen4exp/kernels/ngram.cpp`), without ExLlamaV3's final rounding of the row to fp16. `exl3_expert_parity` holds it to
+`exl3.ngram_rows` bit for bit at every K, and `exl3_upstream_check.py` holds that to `ngram_codec.dequant_rows` (no
+difference over 1024 rows of the 1.66 bpw quant's table) and the engine's read of a pack's rows to both
+(`--ngram-io`: bit-identical on the 1.66 and 2.05 bpw packs).

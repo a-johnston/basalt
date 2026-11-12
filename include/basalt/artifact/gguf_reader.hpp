@@ -128,6 +128,15 @@ inline const char* ggml_type_name(uint32_t t) {
     case 172: return "EXL3-6.0";
     case 174: return "EXL3-7.0";
     case 176: return "EXL3-8.0";
+    // EXL3 n-gram rows (kernels/ngram.hpp): 180 + K
+    case 181: return "EXL3R1";
+    case 182: return "EXL3R2";
+    case 183: return "EXL3R3";
+    case 184: return "EXL3R4";
+    case 185: return "EXL3R5";
+    case 186: return "EXL3R6";
+    case 187: return "EXL3R7";
+    case 188: return "EXL3R8";
     default:
         return "?";
     }
@@ -254,6 +263,11 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         bytes = 2 + kStepBits[t - 144] / 8;
         return true;
     }
+    // EXL3 n-gram rows: 160 values = fp16 scale + 160 steps of K bits
+    case 181: case 182: case 183: case 184: case 185: case 186: case 187: case 188:
+        elems = 160;
+        bytes = 2 + 20 * (int) (t - 180);
+        return true;
     default:
         return false;
     }
