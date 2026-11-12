@@ -102,8 +102,43 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+namespace {
+// The mul1 codebook by byte sum (0 .. 1020): fp16(fma(1024 + S, k_inv, k_bias)) as float.
+struct Mul1BySum {
+    float v[1021];
+    Mul1BySum() {
+        const double k_inv = (double) f32_from_f16(0x1eee), k_bias = (double) f32_from_f16(0xc931);
+        // the product and the sum are exact in double, so the conversions round once, as the fma does
+        for (int s = 0; s <= 1020; ++s) v[s] = f32_from_f16(f16_from_f32((float) ((double) (1024 + s) * k_inv + k_bias)));
+    }
+};
+}  // namespace
+
+void exl3_ring_dequant_row(const uint8_t* row, int k, const float* bias160, float* out160) {
+    static const Mul1BySum cb;
+    uint16_t w[1 + PLE_HEAD_DIM * 8 / 16];
+    const int words = PLE_HEAD_DIM * k / 16;
+    std::memcpy(w, row, (size_t) 2 * (1 + words));   // x86 is little-endian
+    const float scale = f32_from_f16(w[0]);
+    const uint16_t* st = w + 1;
+    const uint32_t mask = (1u << k) - 1;
+    auto symbol = [&](int i) {
+        const int bit = i * k, lo = bit >> 4, hi = lo + 1 == words ? 0 : lo + 1;
+        return ((((uint32_t) st[hi] << 16) | st[lo]) >> (bit & 15)) & mask;
+    };
+    // the state before step 0 holds the ring's last steps
+    uint32_t state = 0;
+    for (int i = PLE_HEAD_DIM - (15 + k) / k; i < PLE_HEAD_DIM; ++i) state = (state << k) | symbol(i);
+    for (int i = 0; i < PLE_HEAD_DIM; ++i) {
+        state = ((state << k) | symbol(i)) & 0xffffu;
+        const uint32_t x = state * 0x83DCD12Du;
+        const float v = cb.v[(x & 0xff) + ((x >> 8) & 0xff) + ((x >> 16) & 0xff) + (x >> 24)] * scale;
+        out160[i] = bias160 != nullptr ? v + bias160[i] : v;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
-enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16 };
+enum class PleFormat { IQ4_NL, Q5_0, Q8_0, BF16, EXL3 };
 
 struct PleTable::Impl {
     GgufFile* file = nullptr;
@@ -130,8 +165,19 @@ struct PleTable::Impl {
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
     uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
-    void decode(const uint8_t* row, float* out160) const {
+    // EXL3 rows: bits per value, the name, and each head's bias
+    int exl3_k = 0;
+    char exl3_name[8] = {};
+    PleConsts consts = ple_artifact_consts();
+    std::vector<float> head_bias;
+    const float* bias_of(uint32_t row) const {
+        int h = PLE_N_HEADS - 1;
+        while (h > 0 && row < consts.offset[h]) --h;
+        return head_bias.data() + (size_t) h * PLE_HEAD_DIM;
+    }
+    void decode(uint32_t index, const uint8_t* row, float* out160) const {
         switch (fmt) {
+        case PleFormat::EXL3: exl3_ring_dequant_row(row, exl3_k, bias_of(index), out160); break;
         case PleFormat::Q5_0:
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) basalt::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
             break;
@@ -180,17 +226,37 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL, Q5_0, Q8_0 or BF16 rows
+    // IQ4_NL, Q5_0, Q8_0, BF16 or EXL3 rows
     if (std::strcmp(t->type_name(), "IQ4_NL") == 0) impl_->fmt = PleFormat::IQ4_NL;
     else if (std::strcmp(t->type_name(), "Q5_0") == 0) impl_->fmt = PleFormat::Q5_0;
     else if (std::strcmp(t->type_name(), "Q8_0") == 0) impl_->fmt = PleFormat::Q8_0;
     else if (std::strcmp(t->type_name(), "BF16") == 0) impl_->fmt = PleFormat::BF16;
-    else {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0 or BF16";
+    else if (t->type > (uint32_t) PLE_EXL3_TYPE_BASE && t->type <= (uint32_t) PLE_EXL3_TYPE_BASE + 8) {
+        // each head's bias is its own small tensor beside the table
+        const TensorInfo* b = impl_->file->find("per_layer_token_embd.head_bias");
+        if (b == nullptr || b->type != 1 || b->shape.size() != 2 || b->shape[0] != (uint64_t) PLE_HEAD_DIM ||
+            b->shape[1] != (uint64_t) PLE_N_HEADS) {
+            err = "per_layer_token_embd.head_bias (F16, 160 x 16) is not in " + gguf_path;
+            close();
+            return false;
+        }
+        impl_->fmt = PleFormat::EXL3;
+        impl_->exl3_k = (int) t->type - PLE_EXL3_TYPE_BASE;
+        std::snprintf(impl_->exl3_name, sizeof impl_->exl3_name, "EXL3R%d", impl_->exl3_k);
+        impl_->head_bias.resize((size_t) PLE_N_HEADS * PLE_HEAD_DIM);
+        const uint8_t* bd = impl_->file->tensor_data(*b);
+        for (size_t i = 0; i < impl_->head_bias.size(); ++i) {
+            uint16_t v;
+            std::memcpy(&v, bd + 2 * i, 2);
+            impl_->head_bias[i] = f32_from_f16(v);
+        }
+    } else {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0, BF16 or EXL3R";
         close();
         return false;
     }
-    impl_->rb = impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
+    impl_->rb = impl_->fmt == PleFormat::EXL3 ? (uint32_t) ple_exl3_row_bytes(impl_->exl3_k)
+              : impl_->fmt == PleFormat::Q8_0 ? PLE_ROW_BYTES_Q8_0
               : impl_->fmt == PleFormat::Q5_0 ? PLE_ROW_BYTES_Q5_0
               : impl_->fmt == PleFormat::BF16 ? PLE_ROW_BYTES_BF16 : PLE_ROW_BYTES;
     // PleReader's row_bytes is a runtime parameter: every format's rows go through the same generic path
@@ -308,13 +374,16 @@ void PleTable::close() {
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = PleFormat::IQ4_NL;
+    impl_->exl3_k = 0;
+    impl_->head_bias.clear();
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
 const char* PleTable::format() const {
-    return impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0"
-           : impl_->fmt == PleFormat::BF16 ? "BF16" : "IQ4_NL";
+    return impl_->fmt == PleFormat::EXL3 ? impl_->exl3_name
+         : impl_->fmt == PleFormat::Q8_0 ? "Q8_0" : impl_->fmt == PleFormat::Q5_0 ? "Q5_0"
+         : impl_->fmt == PleFormat::BF16 ? "BF16" : "IQ4_NL";
 }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
@@ -329,7 +398,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
             std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
             return;
         }
-        impl_->decode(raw, out160);
+        impl_->decode(row, raw, out160);
         impl_->bytes_read += impl_->rb;
         return;
     }
@@ -337,7 +406,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
         std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
         return;
     }
-    impl_->decode(impl_->data + (size_t) row * impl_->rb, out160);
+    impl_->decode(row, impl_->data + (size_t) row * impl_->rb, out160);
     impl_->bytes_read += impl_->rb;
 }
 
@@ -366,7 +435,7 @@ bool PleTable::collect(float* out2560, std::string& err) {
     if (impl_->mode == PleIo::Direct) {
         if (!impl_->reader.collect(t, err)) return false;
         for (int h = 0; h < PLE_N_HEADS; ++h)
-            impl_->decode(impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
+            impl_->decode(impl_->rows[h], impl_->raw + (size_t) h * impl_->rb, out2560 + (size_t) h * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) PLE_N_HEADS * impl_->rb;
         return true;
     }
@@ -381,7 +450,7 @@ bool PleTable::gather_rows(const uint32_t* rows, size_t n_tokens, float* out, st
         std::vector<uint8_t> raw(n * impl_->rb);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
-        for (size_t i = 0; i < n; ++i) impl_->decode(raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
+        for (size_t i = 0; i < n; ++i) impl_->decode(rows[i], raw.data() + i * impl_->rb, out + i * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }
@@ -429,7 +498,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         if (!ok) return false;
         for (size_t t = 0; t < n_tokens; ++t)
             for (int h = 0; h < PLE_N_HEADS; ++h)
-                impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb, out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
+                impl_->decode(impl_->prefetch_keys[t][h], impl_->prefetch_raw[t] + (size_t) h * impl_->rb, out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }

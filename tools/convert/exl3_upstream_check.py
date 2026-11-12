@@ -1,8 +1,9 @@
-"""Checks tools/convert/exl3.py, and the engine's EXL3 expert, against ExLlamaV3 itself on a real
+"""Checks tools/convert/exl3.py, and the engine's reads of an EXL3 pack, against ExLlamaV3 itself on a real
 checkpoint.  Run it with a Python that has torch and an ExLlamaV3 checkout built in place (not Basalt's environment):
 
     python tools/convert/exl3_upstream_check.py --exllamav3 DIR --checkpoint DIR [--tensor NAME ...]
     python tools/convert/exl3_upstream_check.py --exllamav3 DIR --checkpoint DIR --expert L E --expert-io FILE
+    python tools/convert/exl3_upstream_check.py --exllamav3 DIR --checkpoint DIR --ngram-io FILE
 
 The first form checks the token-embedding rows and, when the directory holds ngram_embedding.safetensors, the n-gram
 rows against `ngram_codec.dequant_rows`, then each matrix (by default one of every (kind, bitrate) pair) against
@@ -12,6 +13,9 @@ are checked.
 
 --expert-io compares the engine's CPU expert with ExLlamaV3's on layer L's expert E: FILE is what
 `build/exl3_expert_parity --io` wrote for that expert's blob (inputs, then the engine's outputs).
+
+--ngram-io compares the engine's read of a pack's n-gram rows (FILE from `build/exl3_expert_parity --ngram-io PACK
+FILE`) with exl3.ngram_rows and ExLlamaV3's decoder.
 """
 import argparse
 import json
@@ -84,8 +88,9 @@ def check_embeddings(torch, N, t) -> int:
     return bad
 
 
-def check_ngram(torch, N, path: pathlib.Path) -> int:
-    """The first and last 32 rows of every head and the table's last 32 against ngram_codec.dequant_rows, exactly."""
+def check_ngram(torch, N, path: pathlib.Path, engine_io=None) -> int:
+    """The first and last 32 rows of every head and the table's last 32 against ngram_codec.dequant_rows, exactly;
+    with `engine_io`, the rows in that file instead, and the engine's values against exl3.ngram_rows bit for bit."""
     head, base = header(path)
     get = lambda suffix, dt: next(np.fromfile(path, dtype=dt, count=int(np.prod(v["shape"])),
                                               offset=base + v["data_offsets"][0]).reshape(v["shape"])
@@ -96,8 +101,13 @@ def check_ngram(torch, N, path: pathlib.Path) -> int:
     words = shards[0][1]["shape"][1]
     total = sum(v["shape"][0] for _, v in shards)
     table = np.memmap(path, dtype="<i2", mode="r", offset=base + shards[0][1]["data_offsets"][0], shape=(total, words))
-    pick = np.unique(np.concatenate([np.arange(o, o + 32) for o in offsets] + [np.arange(o - 32, o) for o in offsets[1:]]
-                                    + [np.arange(total - 32, total)]))
+    if engine_io is None:
+        pick = np.unique(np.concatenate([np.arange(o, o + 32) for o in offsets] + [np.arange(o - 32, o) for o in offsets[1:]]
+                                        + [np.arange(total - 32, total)]))
+    else:
+        raw = np.fromfile(engine_io, dtype="<u4")
+        n = raw.size // (1 + X.NGRAM_DIM)
+        pick, engine = raw[:n].astype(np.int64), raw[n:].view("<f4").reshape(n, X.NGRAM_DIM)
     heads = np.clip(np.searchsorted(offsets, pick, side="right") - 1, 0, len(offsets) - 1)
     packed = np.ascontiguousarray(table[pick])
     k = X.ngram_bits(words)
@@ -106,7 +116,13 @@ def check_ngram(torch, N, path: pathlib.Path) -> int:
     err = float(np.abs(got.astype(np.float64) - up.double().numpy()).max())
     print(f"{'ok  ' if err == 0 else 'FAIL'} n-gram table: {len(pick)} rows over the {len(offsets)} heads at {k} bpw, "
           f"max abs diff {err:.2e} against ngram_codec.dequant_rows")
-    return int(err != 0)
+    bad = err != 0
+    if engine_io is not None:
+        same = np.array_equal(engine.view(np.uint32), got.view(np.uint32))
+        print(f"{'ok  ' if same else 'FAIL'} n-gram table: the engine's {len(pick)} rows "
+              f"{'equal' if same else 'DIFFER from'} exl3.ngram_rows bit for bit")
+        bad += not same
+    return int(bad)
 
 
 def check_matrices(torch, ext, LinearEXL3, t, names) -> int:
@@ -177,6 +193,7 @@ def main():
     ap.add_argument("--tensor", action="append", default=[])
     ap.add_argument("--expert", nargs=2, type=int, metavar=("L", "E"))
     ap.add_argument("--expert-io", metavar="FILE")
+    ap.add_argument("--ngram-io", metavar="FILE")
     a = ap.parse_args()
     if bool(a.expert) != bool(a.expert_io):
         ap.error("--expert and --expert-io go together")
@@ -191,6 +208,10 @@ def main():
     ngram = d / NGRAM_FILE
     if a.expert_io:
         bad = check_expert_io(torch, LinearEXL3, t, a.expert[0], a.expert[1], a.expert_io)
+    elif a.ngram_io:
+        if not ngram.is_file():
+            ap.error(f"{ngram} not found")
+        bad = check_ngram(torch, N, ngram, a.ngram_io)
     else:
         bad = 0
         if not a.tensor:

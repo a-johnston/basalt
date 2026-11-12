@@ -6,8 +6,11 @@
 //     build/exl3_expert_parity --io BLOB GU D OUT   one real expert blob (types GU / D) on fixed inputs: writes
 //                                              x (NT x H floats) then y (NT x H floats) to OUT, for a comparison
 //                                              with ExLlamaV3 (tools/convert/exl3_upstream_check.py --expert-io)
+//     build/exl3_expert_parity --ngram-io PACK OUT  rows of PACK's EXL3 n-gram table as the engine reads them, for
+//                                              exl3_upstream_check.py --ngram-io
 //
-// (a) the decoder against checksums computed by tools/convert/exl3.py, which is checked against ExLlamaV3.
+// (a) the trellis and n-gram row decoders against checksums computed by tools/convert/exl3.py, which is checked
+// against ExLlamaV3.
 // (b) the reference: exl3_dequant_inner (the fp16 codebook values), the transforms and a SwiGLU expert in double.
 // (c) the CPU path (native_quant_act / native_gu_rows / native_quant_h / native_down_rows): within a tolerance of
 // (b) (int16 activations, the codebook before its fp16 rounding), every ISA bit for bit, a token alone against the
@@ -16,10 +19,12 @@
 // activations on the tensor cores) against (b); an entry alone against the same entry in a call of several groups,
 // and one block row striding over the groups, bit for bit.  (e) the prompt path's dequantizer against the
 // original-basis weights in double.
+#include "basalt/core/model_file.hpp"
 #include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/kernels/f16_bits.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 
@@ -372,7 +377,33 @@ int decoder_checks() {
     for (int t = 0; t < 256; ++t) psum += (uint32_t) (t + 1) * cpu::kExl3Perm[t];
     if (psum != 4338624u) { std::printf("  tile permutation: checksum %u\n", psum); ++failures; }
     std::printf("decoder vs tools/convert/exl3.py (11 bitrates, the codebook, the tile order): %s\n", failures ? "DIFFER" : "equal");
-    return failures;
+    // the n-gram rows (models/qwen4exp/kernels/ngram.hpp) against exl3.ngram_rows, K = 1 .. 8
+    static const uint32_t ngram_want[8] = {0x65c72248u, 0xe38af004u, 0xc013affcu, 0x01541584u,
+                                           0x116b08d8u, 0xbc7c6740u, 0xe1eb33f8u, 0xeb39dcc8u};
+    int ngram_failures = 0;
+    for (int kb = 1; kb <= 8; ++kb) {
+        uint8_t row[k::PLE_ROW_BYTES_MAX];
+        for (int i = 0; i < k::ple_exl3_row_bytes(kb); ++i) row[i] = (uint8_t) (((i * 37 + 11) & 0xff) ^ (((i * i) >> 3) & 0xff));
+        float v[k::PLE_HEAD_DIM], vb[k::PLE_HEAD_DIM], bias[k::PLE_HEAD_DIM];
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) bias[i] = 0.001f * (float) (i - 80);
+        k::exl3_ring_dequant_row(row, kb, nullptr, v);
+        k::exl3_ring_dequant_row(row, kb, bias, vb);
+        uint32_t rsum = 0;
+        bool bias_ok = true;
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            uint32_t bits;
+            std::memcpy(&bits, &v[i], 4);
+            rsum += (uint32_t) (i + 1) * bits;
+            bias_ok = bias_ok && vb[i] == v[i] + bias[i];
+        }
+        if (rsum != ngram_want[kb - 1] || !bias_ok) {
+            std::printf("  n-gram row at %d bpw: checksum %08x, expected %08x, bias %s\n", kb, rsum, ngram_want[kb - 1],
+                        bias_ok ? "ok" : "WRONG");
+            ++ngram_failures;
+        }
+    }
+    std::printf("n-gram row decoder vs tools/convert/exl3.py (8 bitrates): %s\n", ngram_failures ? "DIFFER" : "equal");
+    return failures + ngram_failures;
 }
 
 int parity(int k2) {
@@ -499,10 +530,43 @@ int io(const char* blob_path, int gu, int d, const char* out_path) {
     return 0;
 }
 
+// Rows of a pack's EXL3 n-gram table as the engine reads them, for exl3_upstream_check.py --ngram-io: the first two
+// and the last row of every head and the table's last row, as uint32 indices and then 160 floats each.
+int ngram_io(const char* pack, const char* out_path) {
+    basalt::core::ModelFile container;
+    std::string err;
+    if (!container.open(pack, err) || !container.load_meta(err) || !container.register_gguf_view(err)) {
+        std::printf("%s\n", err.c_str());
+        return 1;
+    }
+    k::PleTable table;
+    if (!table.open(pack, err, k::PleIoOptions{})) { std::printf("%s\n", err.c_str()); return 1; }
+    const k::PleConsts c = k::ple_artifact_consts();
+    std::vector<uint32_t> rows;
+    for (int h = 0; h < k::PLE_N_HEADS; ++h)
+        for (const uint64_t r : {c.offset[h], c.offset[h] + 1, c.offset[h] + c.vocab[h] - 1}) rows.push_back((uint32_t) r);
+    rows.push_back((uint32_t) (table.rows() - 1));
+    std::vector<float> v(rows.size() * k::PLE_HEAD_DIM);
+    for (size_t i = 0; i < rows.size(); ++i) table.read_row(rows[i], v.data() + i * k::PLE_HEAD_DIM);
+    // the batched read of the same rows gives the same values
+    std::vector<float> batch((size_t) 3 * k::NG_N_EMBD);
+    if (!table.gather_rows(rows.data(), 3, batch.data(), err)) { std::printf("%s\n", err.c_str()); return 1; }
+    if (std::memcmp(batch.data(), v.data(), batch.size() * sizeof(float)) != 0) { std::printf("gather_rows and read_row DIFFER\n"); return 1; }
+    FILE* o = std::fopen(out_path, "wb");
+    if (!o) return 1;
+    std::fwrite(rows.data(), 4, rows.size(), o);
+    std::fwrite(v.data(), 4, v.size(), o);
+    std::fclose(o);
+    std::printf("%s: %zu rows of the %s table (%llu rows) written to %s\n", pack, rows.size(), table.format(),
+                (unsigned long long) table.rows(), out_path);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 6 && std::string(argv[1]) == "--io") return io(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argv[5]);
+    if (argc == 4 && std::string(argv[1]) == "--ngram-io") return ngram_io(argv[2], argv[3]);
     if (argc > 1 && std::string(argv[1]) == "--cpu-bench") {
         for (const int k2 : {3, 4, 8})
             for (const cpu::Exl3Isa isa : {cpu::Exl3Isa::scalar, cpu::Exl3Isa::avx2, cpu::Exl3Isa::avx512})

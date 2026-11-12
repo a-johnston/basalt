@@ -48,6 +48,9 @@ inline constexpr int PLE_ROW_BYTES_Q5_0 = (PLE_HEAD_DIM / 32) * 22;       // 110
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;       // 170: a Q8_0 row
 inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;                // 320: a BF16 row
 inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;
+// An EXL3 row of K bits per value (type id PLE_EXL3_TYPE_BASE + K, K = 1 .. 8): 2 + 20 K bytes, at most 162.
+inline constexpr int PLE_EXL3_TYPE_BASE = 180;
+inline constexpr int ple_exl3_row_bytes(int k) { return 2 + PLE_HEAD_DIM * k / 8; }
 
 /// The artifact's own hash constants, transcribed from the GGUF metadata:
 ///
@@ -98,6 +101,13 @@ int iq4nl_code(int code);
 /// so byte j carries elements j and j+16 - NOT 2j and 2j+1, which is the natural reading and which produces
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
+
+/// One EXL3 n-gram row (ExLlamaV3's exl3_ngram_trellis) -> 160 floats.  The row is 1 + 10 K little-endian uint16:
+/// an fp16 scale, then a tail-biting ring of 160 steps of K bits, step i in stream bits [i K, (i + 1) K), least
+/// significant bit first.  Step i's 16-bit state has its own K bits lowest and the earlier steps' above them, and
+///     out[i] = fp16(fma(1024 + S, 0x1eee, 0xc931)) * scale + bias[i],   S = bytesum(state * 0x83DCD12D mod 2^32)
+/// in float; `bias160` is the row's head's 160 values (`per_layer_token_embd.head_bias`), or null for none.
+void exl3_ring_dequant_row(const uint8_t* row, int k, const float* bias160, float* out160);
 
 /// How the table's rows are read. `Direct` is the default: 4 KiB reads from the SSD (platform::DirectFile),
 /// so the table never occupies the process's memory. `Mmap` is the earlier memory-mapped path, kept as the
@@ -174,7 +184,7 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the whole table was locked (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "Q5_0".
+    /// "IQ4_NL", "Q5_0", "Q8_0", "BF16" or "EXL3R<K>".
     const char* format() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
