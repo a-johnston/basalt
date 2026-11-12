@@ -1562,10 +1562,15 @@ target_sources(kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels
                                          src/kernels/cpu/kq_avx2.cpp
                                          src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ggml/ggml_cpu_dispatch.cpp
                                          src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
+                                         src/kernels/cpu/exl3_cpu.cpp src/kernels/cpu/exl3_avx2.cpp
+                                         src/kernels/cpu/exl3_avx512.cpp
                                          $<TARGET_OBJECTS:ggml_dots_avx2> $<TARGET_OBJECTS:ggml_dots_avx512>)
 # the APR trellis experts' CPU kernels (tq_cpu.hpp): tq_cpu.cpp runs on any x86-64 and picks one at run time
 set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
 set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
+# the EXL3 experts' CPU kernels (exl3_cpu.hpp), picked the same way
+set_source_files_properties(src/kernels/cpu/exl3_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx2_flags}")
+set_source_files_properties(src/kernels/cpu/exl3_avx512.cpp PROPERTIES COMPILE_OPTIONS "${_isa_avx512_flags}")
 # the i-quant rows also use BMI2 (pdep/pext for the sign masks; cpu_avx512_ok requires it). MSVC compiles the
 # intrinsics without a switch.
 if(MSVC)
@@ -1765,6 +1770,12 @@ if(BUILD_TESTING)
   target_link_libraries(tq_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
   basalt_gpu_test(NAME tq_expert_parity COMMAND tq_expert_parity)
   set_tests_properties(tq_expert_parity PROPERTIES TIMEOUT 300)
+  # the EXL3 experts: the decoder against the converter's reference, the CPU path against a double reference
+  # (--cpu-bench: timings)
+  add_executable(exl3_expert_parity tests/kernels/exl3_expert_parity.cpp)
+  target_link_libraries(exl3_expert_parity PRIVATE kernels_cpu)
+  basalt_cpu_test(NAME exl3_expert_parity COMMAND exl3_expert_parity)
+  set_tests_properties(exl3_expert_parity PROPERTIES TIMEOUT 300)
   if(BASALT_MODEL_QWEN4EXP)
   # the PCIe share's staging copy (fetch_blobs, rebase_ptrs) byte for byte (--bench: GB/s)
   add_executable(fetch_blobs_parity tests/models/qwen4exp/kernels/fetch_blobs_parity.cpp)

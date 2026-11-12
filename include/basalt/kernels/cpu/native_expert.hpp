@@ -5,7 +5,9 @@
 // blob is the three GGUF slices back to back, [gate rows | up rows | down rows], and the arithmetic is ggml's
 // own (`ggml_get_type_traits_cpu`, extracted in src/kernels/cpu/ggml): the activation is quantized with the weight type's `vec_dot_type` and each row
 // is one `vec_dot`, exactly what llama.cpp's CPU backend computes for the same tensor.  The APR trellis types
-// (TQ2_T .. TQP7, 144-149) run on the engine's own kernels (tq_cpu.hpp) against Q8_0 activations.
+// (TQ2_T .. TQP7, 144-149) run on the engine's own kernels (tq_cpu.hpp) against Q8_0 activations.  The EXL3 types
+// (exl3_cpu.hpp, 160 + 2 K) transform their input per expert and per matrix, so their "quantized" activation is
+// the token's floats as they are and the kernels do the rest; their rows come in blocks of 128.
 #pragma once
 
 #include <cstddef>
@@ -14,11 +16,11 @@
 
 namespace basalt::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (5120 values as Q8_K: 20 x 292).
-inline constexpr size_t kNativeActBytes = 6144;
+/// Bytes of the largest activation any native layer uses (5120 values as Q8_K: 20 x 292; 2560 as float, the EXL3 form).
+inline constexpr size_t kNativeActBytes = 10240;
 /// The widest expert intermediate a native layer may have (the float buffers between gate/up and down).
 inline constexpr int kNativeMaxFF = 2304;
-/// Bytes of the largest quantized down activation (2304 values as Q8_K: 9 x 292, or Q8_0 72 x 34).
+/// Bytes of the largest down activation (2304 values as Q8_K: 9 x 292, or Q8_0 72 x 34; 640 as float, the EXL3 form).
 inline constexpr size_t kNativeHBytes = 3072;
 
 /// One layer's native expert geometry.  Gate and up usually share a type; a layer whose up rows have their own type
@@ -32,7 +34,8 @@ struct NativeFmt {
     size_t up_row = 0;                  ///< bytes per up row (gu_row when the types agree)
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
-    size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
+    size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0};
+                                        ///< EXL3: its six fp16 vectors suh_g svh_g suh_u svh_u suh_d svh_d
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
     float swiglu_limit = 0.f;           ///< > 0: gate capped at it and up clamped to +-it before the product
     /// Hadamard-folded experts (hadamard.hpp): native_quant_act / native_quant_h apply y = H_block (signs * x)
@@ -57,7 +60,7 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 inline constexpr size_t kNvfp4Tail = 16;
 
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens (NVFP4: gate and up times
-/// s_gate and s_up first).
+/// s_gate and s_up first).  EXL3: the 128-row blocks that start in [r0, r1), here and in native_down_rows.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1) (NVFP4: times s_down).

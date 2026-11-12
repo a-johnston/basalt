@@ -86,6 +86,7 @@ WIDTH_OK = {
     "src/prefill/moe_mmq.cu": "the Q2_0 blob layout of that format's instance",
     "include/basalt/prefill/moe_mmq.hpp": "the Q2_0 blob layout of that format's instance",
     "include/basalt/kernels/cpu/expert.hpp": "the capacity of the Q8_1 activation block, not a model width",
+    "include/basalt/kernels/cpu/native_expert.hpp": "the capacity of the pool's activation buffers, not a model width",
     "src/kernels/cpu/kq_avx2.cpp": "a loop bound in a comment",
 }
 hits = []

@@ -116,6 +116,18 @@ inline const char* ggml_type_name(uint32_t t) {
         return "TQP6";
     case 149:
         return "TQP7";
+    // EXL3 mul1 experts (kernels/cpu/exl3_cpu.hpp): 160 + 2 K
+    case 162: return "EXL3-1.0";
+    case 163: return "EXL3-1.5";
+    case 164: return "EXL3-2.0";
+    case 165: return "EXL3-2.5";
+    case 166: return "EXL3-3.0";
+    case 167: return "EXL3-3.5";
+    case 168: return "EXL3-4.0";
+    case 170: return "EXL3-5.0";
+    case 172: return "EXL3-6.0";
+    case 174: return "EXL3-7.0";
+    case 176: return "EXL3-8.0";
     default:
         return "?";
     }
