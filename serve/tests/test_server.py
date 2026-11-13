@@ -2732,6 +2732,7 @@ class UsageAndStatus(unittest.TestCase):
         b = self.chat("/v1/chat/completions")
         u, t = b["usage"], b["timings"]
         self.assertEqual(u["prompt_tokens_details"]["cached_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(u["completion_tokens_details"]["reasoning_tokens"], len("</think>"))   # the script's thinking
         self.assertEqual(t["cache_n"], ClockedEngine.REUSED)
         self.assertEqual(t["prompt_n"] + t["cache_n"], u["prompt_tokens"])
         self.assertEqual(t["predicted_n"], u["completion_tokens"])
@@ -2741,6 +2742,7 @@ class UsageAndStatus(unittest.TestCase):
     def test_openai_stream(self):
         last = self.chat("/v1/chat/completions", stream=True)[-1]
         self.assertEqual(last["usage"]["prompt_tokens_details"]["cached_tokens"], ClockedEngine.REUSED)
+        self.assertEqual(last["usage"]["completion_tokens_details"]["reasoning_tokens"], len("</think>"))
         self.assertEqual(last["timings"]["cache_n"], ClockedEngine.REUSED)
 
     def test_anthropic(self):
