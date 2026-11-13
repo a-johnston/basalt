@@ -2696,6 +2696,15 @@ class UsageAndStatus(unittest.TestCase):
             req = urllib.request.Request(self.base + "/v1/models", headers={"Origin": "https://chat.example.com"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "https://chat.example.com")
+            # /props too, where a page detects Basalt; not the other llama.cpp routes
+            for path in ("/props", "/props/"):
+                req = urllib.request.Request(self.base + path, headers={"Origin": "https://chat.example.com"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), "https://chat.example.com", path)
+            self.assertEqual(self.preflight("/props")[1].get("Access-Control-Allow-Origin"), "https://chat.example.com")
+            req = urllib.request.Request(self.base + "/health", headers={"Origin": "https://chat.example.com"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
             self.svc.cors_origins = ["*"]
             self.assertEqual(self.preflight("/v1/messages", "https://any.example.com")[1]
                              .get("Access-Control-Allow-Origin"), "*")
