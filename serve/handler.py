@@ -237,8 +237,9 @@ def make_handler(target: Service | Router):
             threading.Thread(target=watch, daemon=True, name="client-watch").start()
 
         def _cors(self):
-            """CORS headers, only for /v1/* and a listed origin."""
-            if not svc.cors_origins or not self.path.split("?")[0].startswith("/v1/"):
+            """CORS headers for a listed origin, on the API only: /v1/* and /props, where a client detects Basalt."""
+            path = self.path.split("?")[0]
+            if not svc.cors_origins or not (path.startswith("/v1/") or path.rstrip("/") == "/props"):
                 return
             origin = (self.headers.get("Origin") or "").rstrip("/")
             if "*" in svc.cors_origins:

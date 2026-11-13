@@ -576,7 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
                     help="also answer to this Host name (repeatable; \"*\" turns the check off)")
     ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
-                    help="let web pages from this origin use /v1/* (repeatable)")
+                    help="let web pages from this origin use /v1/* and /props (repeatable)")
     ap.add_argument("--max-payload-mib", type=int, default=256, metavar="MIB",
                     help="the largest request body the server reads, in MiB; a bigger one gets a 413 (default 256)")
     ap.add_argument("--debug", action="store_true",

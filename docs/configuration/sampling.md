@@ -103,7 +103,8 @@ The call takes the API key like every `/v1` route. A page on another origin read
 endpoint above is served, `"logprobs"` that logprobs come back on all three APIs with the thinking's and tool calls' tokens
 ([logprobs](#logprobs)), `"documents"` that messages may carry PDF and text documents ([documents](documents.md)), and `"video"` (only
 while video is on) that this model takes video parts now (image input on, a model that reads video, FFmpeg found:
-[video](../running.md#video)). Later features add their names to the same list.
+[video](../running.md#video)). Later features add their names to the same list. A page on another origin reads `/props` through
+`--cors-origin`.
 
 ## Thinking loops
 
