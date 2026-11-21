@@ -64,11 +64,13 @@ void attention(const float* q, const float* r, const float* sinks, const float* 
                const uint16_t* k_cache, const uint16_t* v_cache, const AttnArgs& a, int64_t pos0, int rows, void* ws, float* out,
                void* stream);
 
-/// The routed experts of `rows` rows of k picks (`ids`, [rows][k]) as native_expert_grouped's groups, one per expert picked
-/// in expert order, its entries in row order: grp_ptr[g] = base + expert blob_bytes, ent_dst = row k + j, ent_tok = row.
-void group_experts(const int32_t* ids, int rows, int k, int n_expert, const uint8_t* base, uint64_t blob_bytes,
-                   unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok,
-                   void* stream);
+/// The routed experts of `rows` rows of k picks (`ids`, [rows][k]) as native_expert_grouped's groups. Expert e's blob is at
+/// `expert_ptr[e]` and its rate pair is `expert_class[e]` of `n_class`: class c's groups (one per expert picked, in expert
+/// order, its entries in row order) are grp_ptr + c n_expert, grp_start + c (n_expert + 1) and n_groups[c], their entries
+/// in ent_dst (row k + j) and ent_tok (row) after those of the classes before, so one call per class reads its own.
+void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* expert_ptr,
+                   const int32_t* expert_class, int n_class, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
+                   int32_t* ent_dst, int32_t* ent_tok, void* stream);
 /// y[row] = sum_j w[row][j] out[row k + j], j in order.
 void sum_experts(const float* out, const float* w, int rows, int k, int n_embd, float* y, void* stream);
 

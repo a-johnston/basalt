@@ -19,6 +19,8 @@ Inkling2Model::~Inkling2Model() {
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (experts_) cudaFree(experts_);
+    if (d_ptr_) cudaFree(d_ptr_);
+    if (d_cls_) cudaFree(d_cls_);
     if (fd_ >= 0) platform::close_fd(fd_);
 }
 
@@ -42,19 +44,33 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     desc_.n_expert_used = g.n_used;
     desc_.n_ff_exp = g.n_ff_exp;
     desc_.context_length = g.context_length;
+    // each layer's experts by rate pair: a layout per pair (one for a uniform layer), each expert its pair's index
+    classes_.assign((size_t) g.n_layers, {});
+    std::vector<int32_t> cls((size_t) g.n_layers * g.n_expert);
     for (int l = 0; l < g.n_layers; ++l) {
-        const ExpertLayer& e = pack_.experts[(size_t) l];
-        desc_.expert_gate_up_type.push_back(e.gu_type);
-        desc_.expert_down_type.push_back(e.d_type);
-        if (!::basalt::kernels::native_expert_supported(e.gu_type, e.d_type, g.n_embd, g.n_ff_exp))
-            return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + "'s experts (gate/up type " + std::to_string(e.gu_type) +
-                                              ", down " + std::to_string(e.d_type) + ") have no kernels"};
-        ::basalt::kernels::NativeExpertLayout lay = ::basalt::kernels::native_expert_layout(e.gu_type, e.d_type, g.n_embd, g.n_ff_exp);
-        if (lay.bytes != e.blob_bytes)
-            return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + "'s expert blob size does not match its layout"};
-        lay.situ_beta = g.situ_beta;
-        lay.situ_up = g.situ_up;
-        layouts_.push_back(lay);
+        const ExpertLayer& el = pack_.experts[(size_t) l];
+        std::vector<std::pair<int, int>> pairs;
+        for (int e = 0; e < g.n_expert; ++e) {
+            const ExpertBlob& b = el.blobs[(size_t) e];
+            const auto it = std::find(pairs.begin(), pairs.end(), std::make_pair(b.gu_type, b.d_type));
+            int c = (int) (it - pairs.begin());
+            if (it == pairs.end()) {
+                if (!::basalt::kernels::native_expert_supported(b.gu_type, b.d_type, g.n_embd, g.n_ff_exp))
+                    return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + "'s experts (gate/up type " + std::to_string(b.gu_type) +
+                                                      ", down " + std::to_string(b.d_type) + ") have no kernels"};
+                ::basalt::kernels::NativeExpertLayout lay = ::basalt::kernels::native_expert_layout(b.gu_type, b.d_type, g.n_embd, g.n_ff_exp);
+                lay.situ_beta = g.situ_beta;
+                lay.situ_up = g.situ_up;
+                classes_[(size_t) l].push_back(lay);
+                pairs.emplace_back(b.gu_type, b.d_type);
+            }
+            if (b.bytes != classes_[(size_t) l][(size_t) c].bytes)
+                return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + " expert " + std::to_string(e) + "'s blob size does not match its layout"};
+            cls[(size_t) l * g.n_expert + e] = c;
+        }
+        max_classes_ = std::max(max_classes_, (int) pairs.size());
+        desc_.expert_gate_up_type.push_back(el.blobs[0].gu_type);
+        desc_.expert_down_type.push_back(el.blobs[0].d_type);
     }
     diag_dump_ = req.diag_dump;
     spec_ = req.spec;
@@ -97,6 +113,17 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     it.dev = experts_;
     it.device = device_;
     reads.add(it);
+    // every expert's device address and rate pair, per layer
+    std::vector<unsigned long long> ptr((size_t) g.n_layers * g.n_expert);
+    for (int l = 0; l < g.n_layers; ++l)
+        for (int e = 0; e < g.n_expert; ++e)
+            ptr[(size_t) l * g.n_expert + e] = (unsigned long long) (uintptr_t) (experts_ + pack_.experts[(size_t) l].blobs[(size_t) e].offset);
+    if (cudaMalloc((void**) &d_ptr_, ptr.size() * sizeof(ptr[0])) != cudaSuccess || cudaMalloc((void**) &d_cls_, cls.size() * 4) != cudaSuccess ||
+        cudaMemcpy(d_ptr_, ptr.data(), ptr.size() * sizeof(ptr[0]), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_cls_, cls.data(), cls.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        return {model::Status::Error, "inkling2x: out of device memory for the expert tables"};
+    }
     ctx_ = req.max_context > 0 ? req.max_context : kDefaultContext;
     if (g.context_length > 0) ctx_ = std::min<int64_t>(ctx_, g.context_length);
     basalt::log::info("basalt inkling2x", "%zu tensors %.2f GiB and the routed experts %.2f GiB on the GPU; context %lld", dev_.size(),

@@ -1,9 +1,12 @@
 // src/models/inkling2x/kernels_parity.cpp - Inkling 2's kernels against plain CPU references in double, at the model's
 // geometry: the depth mix, a loop controller, the short convolutions and their ring, the attention's inputs, the
 // attention (a sliding layer past its window and a full layer past the bias extent), the routed experts with situ
-// through native_expert_grouped (IQ3_XXS gate/up, IQ4_NL down, dequantized by ggml for the reference) and the logits.
+// through native_expert_grouped (IQ3_XXS gate/up and IQ4_NL down, dequantized by ggml; EXL3 at 2.5 and 3 bpw, decoded by
+// the CPU reference) and the logits.
 // A row's result must not depend on the rows beside it: each check also runs its first row alone.
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/cpu/exl3_cpu.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/models/inkling2x/kernels.hpp"
 
@@ -377,6 +380,10 @@ void check_experts() {
         for (int j = 0; j < KTOP; ++j) { ids[(size_t) r * KTOP + j] = pick[j]; wts[(size_t) r * KTOP + j] = 0.5f + 0.25f * j; }
     }
     uint8_t* base = up(blobs);
+    std::vector<unsigned long long> ptrs(NEXP);
+    for (int e = 0; e < NEXP; ++e) ptrs[(size_t) e] = (unsigned long long) (uintptr_t) (base + (size_t) e * L.bytes);
+    unsigned long long* eptr = up(ptrs);
+    int32_t* ecls = up(std::vector<int32_t>(NEXP, 0));
     float* x = up(xh);
     int32_t* idd = up(ids);
     float* wd = up(wts);
@@ -389,7 +396,7 @@ void check_experts() {
     float* eo = zeros<float>((size_t) R * KTOP * E);
     float* y = zeros<float>((size_t) R * E);
     auto run = [&](int rows, float* yy) {
-        k::group_experts(idd, rows, KTOP, NEXP, base, L.bytes, gp, gs, ng, dst, tok, nullptr);
+        k::group_experts(idd, rows, KTOP, NEXP, eptr, ecls, 1, gp, gs, ng, dst, tok, nullptr);
         bk::native_expert_grouped(L, gp, gs, ng, dst, tok, NEXP, (int64_t) rows * KTOP, xq, scratch, eo, nullptr);
         k::sum_experts(eo, wd, rows, KTOP, E, yy, nullptr);
     };
@@ -428,6 +435,117 @@ void check_experts() {
     same("routed experts", down(y1, E).data(), got.data(), E);
 }
 
+// the normalized 128-wide Sylvester-Hadamard transform of each block of v
+void hadamard(std::vector<double>& v) {
+    for (size_t b = 0; b < v.size(); b += 128) {
+        for (int h = 1; h < 128; h <<= 1)
+            for (int i = 0; i < 128; i += 2 * h)
+                for (int j = i; j < i + h; ++j) {
+                    const double x = v[b + j], y = v[b + j + h];
+                    v[b + j] = x + y;
+                    v[b + j + h] = x - y;
+                }
+        for (int i = 0; i < 128; ++i) v[b + i] /= std::sqrt(128.0);
+    }
+}
+
+// y = H (inner (H (suh * x))) * svh for one EXL3 matrix
+std::vector<double> exl3_matvec(int type, const uint8_t* trellis, const __half* suh, const __half* svh, const std::vector<double>& x,
+                                int n_in, int n_out) {
+    std::vector<float> inner((size_t) n_in * n_out);
+    basalt::kernels::cpu::exl3_dequant_inner(type, trellis, n_in, n_out, inner.data());
+    std::vector<double> xr(n_in), y(n_out, 0.0);
+    for (int k = 0; k < n_in; ++k) xr[k] = x[k] * (double) __half2float(suh[k]);
+    hadamard(xr);
+    for (int r = 0; r < n_out; ++r) {
+        double acc = 0;
+        for (int k = 0; k < n_in; ++k) acc += (double) inner[(size_t) r * n_in + k] * xr[k];
+        y[r] = acc;
+    }
+    hadamard(y);
+    for (int r = 0; r < n_out; ++r) y[r] *= (double) __half2float(svh[r]);
+    return y;
+}
+
+// a mixed-rate layer as REXL3 quants have them: even experts 2.5 bpw gate/up and 3 bpw down, odd ones 3 and 3.5, their blobs
+// back to back at their own sizes, one grouped call per rate pair
+void check_exl3_experts() {
+    using basalt::kernels::cpu::kExl3TypeBase;
+    const int R = 3, NE = 16;
+    const int GU[2] = {kExl3TypeBase + 5, kExl3TypeBase + 6}, DN[2] = {kExl3TypeBase + 6, kExl3TypeBase + 7};
+    bk::NativeExpertLayout L[2];
+    for (int c = 0; c < 2; ++c) {
+        L[c] = bk::native_expert_layout(GU[c], DN[c], E, FF);
+        L[c].situ_beta = 4.0f;
+        L[c].situ_up = 25.0f;
+    }
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> mag(0.5f, 1.5f);
+    std::vector<uint8_t> blobs;
+    std::vector<size_t> off(NE);
+    std::vector<int32_t> cls(NE);
+    for (int e = 0; e < NE; ++e) {
+        const int c = e % 2;
+        cls[(size_t) e] = c;
+        off[(size_t) e] = blobs.size();
+        const size_t vec = L[c].bytes - basalt::kernels::cpu::exl3_vec_bytes(E, FF);
+        blobs.resize(blobs.size() + L[c].bytes);
+        uint8_t* b = blobs.data() + off[(size_t) e];
+        for (size_t i = 0; i < vec; ++i) b[i] = (uint8_t) byte(rng);
+        __half* v = (__half*) (b + vec);
+        for (int i = 0; i < 3 * (E + FF); ++i) v[i] = __float2half((byte(rng) & 1 ? 1.0f : -1.0f) * mag(rng));
+    }
+    auto xh = randn((size_t) R * E);
+    std::vector<int32_t> ids((size_t) R * KTOP);
+    std::vector<float> wts((size_t) R * KTOP);
+    for (int r = 0; r < R; ++r) {
+        std::vector<int> pick(NE);
+        for (int e = 0; e < NE; ++e) pick[e] = e;
+        std::shuffle(pick.begin(), pick.end(), rng);
+        for (int j = 0; j < KTOP; ++j) { ids[(size_t) r * KTOP + j] = pick[j]; wts[(size_t) r * KTOP + j] = 0.5f + 0.25f * j; }
+    }
+    uint8_t* base = up(blobs);
+    std::vector<unsigned long long> ptrs(NE);
+    for (int e = 0; e < NE; ++e) ptrs[(size_t) e] = (unsigned long long) (uintptr_t) (base + off[(size_t) e]);
+    unsigned long long* eptr = up(ptrs);
+    int32_t* ecls = up(cls);
+    float* x = up(xh);
+    int32_t* idd = up(ids);
+    float* wd = up(wts);
+    auto* gp = zeros<unsigned long long>(2 * NE);
+    int32_t *gs = zeros<int32_t>(2 * (NE + 1)), *ng = zeros<int32_t>(2), *dst = zeros<int32_t>((size_t) R * KTOP), *tok = zeros<int32_t>((size_t) R * KTOP);
+    void* scratch = zeros<uint8_t>(std::max(bk::native_expert_scratch_bytes(L[0], (int64_t) R * KTOP), bk::native_expert_scratch_bytes(L[1], (int64_t) R * KTOP)));
+    float* eo = zeros<float>((size_t) R * KTOP * E);
+    float* y = zeros<float>((size_t) R * E);
+    auto run = [&](int rows, float* yy) {
+        k::group_experts(idd, rows, KTOP, NE, eptr, ecls, 2, gp, gs, ng, dst, tok, nullptr);
+        for (int c = 0; c < 2; ++c)   // EXL3 reads the rows as floats
+            bk::native_expert_grouped(L[c], gp + c * NE, gs + c * (NE + 1), ng + c, dst, tok, NE, (int64_t) rows * KTOP, x, scratch, eo, nullptr);
+        k::sum_experts(eo, wd, rows, KTOP, E, yy, nullptr);
+    };
+    run(R, y);
+    std::vector<double> ref((size_t) R * E, 0.0);
+    for (int r = 0; r < R; ++r) {
+        const std::vector<double> xr(xh.begin() + (size_t) r * E, xh.begin() + (size_t) (r + 1) * E);
+        for (int j = 0; j < KTOP; ++j) {
+            const int e = ids[(size_t) r * KTOP + j], c = cls[(size_t) e];
+            const uint8_t* b = blobs.data() + off[(size_t) e];
+            const __half* v = (const __half*) (b + L[c].bytes - basalt::kernels::cpu::exl3_vec_bytes(E, FF));   // suh_g svh_g suh_u svh_u suh_d svh_d
+            const auto g = exl3_matvec(GU[c], b, v, v + E, xr, E, FF);
+            const auto u = exl3_matvec(GU[c], b + L[c].up_off, v + E + FF, v + 2 * E + FF, xr, E, FF);
+            std::vector<double> hh(FF);
+            for (int f = 0; f < FF; ++f) hh[f] = 4.0 * std::tanh(g[f] / 4.0) / (1.0 + std::exp(-g[f])) * 25.0 * std::tanh(u[f] / 25.0);
+            const auto d = exl3_matvec(DN[c], b + L[c].down_off, v + 2 * (E + FF), v + 2 * (E + FF) + FF, hh, FF, E);
+            for (int cc = 0; cc < E; ++cc) ref[(size_t) r * E + cc] += wts[(size_t) r * KTOP + j] * d[cc];
+        }
+    }
+    const auto got = down(y, ref.size());
+    report("EXL3 experts, two rate pairs, situ", got, ref, 1e-3);
+    float* y1 = zeros<float>(E);
+    run(1, y1);
+    same("EXL3 experts", down(y1, E).data(), got.data(), E);
+}
+
 void check_logits() {
     const int R = 2, LD = 201024, NV = 200058;
     auto xh = randn((size_t) R * LD, 20.0f);
@@ -448,6 +566,7 @@ int main() {
     check_attention(false);
     check_attention(true);
     check_experts();
+    check_exl3_experts();
     check_logits();
     if (cudaDeviceSynchronize() != cudaSuccess) {
         std::printf("CUDA error: %s\n", cudaGetErrorString(cudaGetLastError()));

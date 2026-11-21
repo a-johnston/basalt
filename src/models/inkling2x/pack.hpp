@@ -37,9 +37,14 @@ struct TensorRef {
     uint64_t bytes = 0;
 };
 
-struct ExpertLayer {
+/// One routed expert's blob: [gate | up | down] (and its vectors, for EXL3) at `offset` inside the experts section.
+struct ExpertBlob {
     int gu_type = 0, d_type = 0;
-    uint64_t offset = 0, blob_bytes = 0;   ///< offset inside the experts section
+    uint64_t offset = 0, bytes = 0;
+};
+
+struct ExpertLayer {
+    std::vector<ExpertBlob> blobs;   ///< per expert: one type pair for a whole layer, or each its own (a mixed-rate quant)
 };
 
 struct Pack {

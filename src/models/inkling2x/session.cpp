@@ -2,6 +2,7 @@
 // forward of a run of rows (a decode window or a prompt chunk): the stored layers before the loop, the loop's core once
 // per pass (each pass after the first mixing in the one before through the controllers), the layers after it, and the
 // output. Every expert of every layer is on the card, so a row's whole forward stays there.
+#include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -58,8 +59,9 @@ public:
                   f(dv_, (size_t) R * g_.n_kv * 4) && f(att_, (size_t) R * nq) && b(attq_, (size_t) R * q8a) && f(o_, (size_t) R * E) &&
                   f(oc_, (size_t) R * E) && f(fx_, (size_t) R * E) && f(fc_, (size_t) R * E) && f(fn_, (size_t) R * E) &&
                   b(fxq_, (size_t) R * q8) && f(rlog_, (size_t) R * g_.n_expert) && alloc((void**) &ids_, (size_t) R * K * 4, err) &&
-                  f(rw_, (size_t) R * K) && alloc((void**) &grp_ptr_, (size_t) g_.n_expert * 8, err) &&
-                  alloc((void**) &grp_start_, (size_t) (g_.n_expert + 1) * 4, err) && alloc((void**) &n_groups_, 4, err) &&
+                  f(rw_, (size_t) R * K) && alloc((void**) &grp_ptr_, (size_t) m_.max_classes() * g_.n_expert * 8, err) &&
+                  alloc((void**) &grp_start_, (size_t) m_.max_classes() * (g_.n_expert + 1) * 4, err) &&
+                  alloc((void**) &n_groups_, (size_t) m_.max_classes() * 4, err) &&
                   alloc((void**) &ent_dst_, (size_t) R * K * 4, err) && alloc((void**) &ent_tok_, (size_t) R * K * 4, err) &&
                   f(eout_, (size_t) R * K * E) && f(moe_, (size_t) R * E) && f(mc_, (size_t) R * E) && f(ctlg_, (size_t) R * g_.gate_rank) &&
                   f(hn_, (size_t) R * E) && b(hq_, (size_t) kMaxWindow * q8) && f(hl_, (size_t) kMaxWindow * g_.vocab_padded) &&
@@ -68,7 +70,8 @@ public:
                   f(d_bias_, (size_t) g_.n_vocab) && f(d_mask_, (size_t) g_.n_vocab);
         if (!ok) return false;
         size_t escr = 0;
-        for (int l = 0; l < g_.n_layers; ++l) escr = std::max(escr, bk::native_expert_scratch_bytes(m_.expert_layout(l), (int64_t) R * K));
+        for (int l = 0; l < g_.n_layers; ++l)
+            for (const bk::NativeExpertLayout& lay : m_.expert_layouts(l)) escr = std::max(escr, bk::native_expert_scratch_bytes(lay, (int64_t) R * K));
         if (!b(escr_, escr) || !b(ws_, ik::attention_workspace_bytes(R, g_.n_head, ctx_))) return false;
         // the layer slots: a K/V cache and a convolution ring each, and a block buffer where a block starts
         const int S = g_.slots();
@@ -346,11 +349,17 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(fn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
-        quant(fn_, R, E, fxq_);
-        const bk::NativeExpertLayout& lay = m_.expert_layout(l);
-        ik::group_experts(ids_, R, g_.n_used, g_.n_expert, m_.experts(l), lay.bytes, grp_ptr_, grp_start_, n_groups_, ent_dst_, ent_tok_, stream_);
-        bk::native_expert_grouped(lay, grp_ptr_, grp_start_, n_groups_, ent_dst_, ent_tok_, g_.n_expert, (int64_t) R * g_.n_used, fxq_, escr_,
-                                  eout_, stream_);
+        // the experts, one call per rate pair: EXL3 reads the rows as floats, the other formats as q8_1 blocks
+        const std::vector<bk::NativeExpertLayout>& lays = m_.expert_layouts(l);
+        bool q8 = false;
+        for (const bk::NativeExpertLayout& lay : lays) q8 |= !bk::cpu::exl3_supported(lay.gu_type);
+        if (q8) quant(fn_, R, E, fxq_);
+        ik::group_experts(ids_, R, g_.n_used, g_.n_expert, m_.expert_ptrs(l), m_.expert_classes(l), (int) lays.size(), grp_ptr_, grp_start_,
+                          n_groups_, ent_dst_, ent_tok_, stream_);
+        for (size_t c = 0; c < lays.size(); ++c)
+            bk::native_expert_grouped(lays[c], grp_ptr_ + c * g_.n_expert, grp_start_ + c * (g_.n_expert + 1), n_groups_ + c, ent_dst_, ent_tok_,
+                                      g_.n_expert, (int64_t) R * g_.n_used, bk::cpu::exl3_supported(lays[c].gu_type) ? (const void*) fn_ : fxq_,
+                                      escr_, eout_, stream_);
         ik::sum_experts(eout_, rw_, R, g_.n_used, E, moe_, stream_);
         ik::short_conv(moe_, F(l, "ffn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv + E, pos0, R, E, post_scale, mc_, stream_);
         ik::conv_store(moe_, ring, 2 * nkv + E, pos0, R, keep, E, stream_);

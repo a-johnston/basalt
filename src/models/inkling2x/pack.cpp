@@ -114,25 +114,47 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
     p.experts_range = p.file.range("experts");
     std::vector<uint8_t> text;
     if (!p.file.read("experts.layout", text, err)) return false;
+    // v5: `layer gu_type d_type offset blob_bytes`, the layer's experts one after another; v8: `layer expert gu_type d_type
+    // offset blob_bytes`, each expert its own
     std::istringstream in(std::string(text.begin(), text.end()));
     std::string line;
+    std::getline(in, line);
+    const bool per_expert = line.rfind("# experts v8:", 0) == 0;
+    if (!per_expert && line.rfind("# experts v5:", 0) != 0) {
+        err = "experts.layout: '" + line + "' is not a layout this engine reads (v5 or v8)";
+        return false;
+    }
     p.experts.assign((size_t) g.n_layers, ExpertLayer{});
-    std::vector<bool> seen((size_t) g.n_layers, false);
+    for (ExpertLayer& el : p.experts) el.blobs.assign((size_t) g.n_expert, ExpertBlob{});
+    std::vector<int> seen((size_t) g.n_layers, 0);
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ls(line);
-        long long l, gu, d;
+        int l, e = 0, gu, d;
         unsigned long long off, by;
-        if (!(ls >> l >> gu >> d >> off >> by) || l < 0 || l >= g.n_layers) {
+        std::string extra;
+        if (!(ls >> l) || (per_expert && !(ls >> e)) || !(ls >> gu >> d >> off >> by) || ls >> extra || l < 0 ||
+            l >= g.n_layers || e < 0 || e >= g.n_expert) {
             err = "experts.layout: bad line '" + line + "'";
             return false;
         }
-        p.experts[(size_t) l] = {(int) gu, (int) d, off, by};
-        seen[(size_t) l] = true;
+        const int count = per_expert ? 1 : g.n_expert;
+        if (!by || off > p.experts_range.bytes || by > (p.experts_range.bytes - off) / count) {
+            err = "experts.layout: empty or out-of-range expert blob";
+            return false;
+        }
+        auto& blobs = p.experts[(size_t) l].blobs;
+        if (blobs[(size_t) e].bytes) {
+            err = "experts.layout: repeated row '" + line + "'";
+            return false;
+        }
+        for (int x = 0; x < count; ++x) blobs[(size_t) (e + x)] = {gu, d, off + (uint64_t) x * by, by};
+        seen[(size_t) l] += count;
     }
     for (int l = 0; l < g.n_layers; ++l)
-        if (!seen[(size_t) l]) {
-            err = "experts.layout has no line for layer " + std::to_string(l);
+        if (seen[(size_t) l] != g.n_expert) {
+            err = "experts.layout lists " + std::to_string(seen[(size_t) l]) + " experts of layer " + std::to_string(l) + ", the model has " +
+                  std::to_string(g.n_expert);
             return false;
         }
     return true;

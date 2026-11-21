@@ -174,13 +174,14 @@ __global__ void qkvr_prep_kernel(float* __restrict__ q, const float* __restrict_
 }
 
 // ----------------------------------------------------------------------------------------------- the routed experts
-// One block, a thread per expert: each lists its entries in row order, then the groups are packed in expert order.
-__global__ void group_experts_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const uint8_t* base,
-                                     unsigned long long blob, unsigned long long* __restrict__ grp_ptr,
+// One block, a thread per expert: each counts its entries; then the groups are laid out class by class in expert order, and
+// each expert writes its entries in row order.
+__global__ void group_experts_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const unsigned long long* __restrict__ ptr,
+                                     const int32_t* __restrict__ cls, int n_class, unsigned long long* __restrict__ grp_ptr,
                                      int32_t* __restrict__ grp_start, int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
                                      int32_t* __restrict__ ent_tok, int k) {
-    extern __shared__ int32_t cnt[];   // [n_expert] counts, then [n_expert + 1] starts
-    int32_t* start = cnt + n_expert;
+    extern __shared__ int32_t cnt[];   // [n_expert] counts, then [n_expert] each expert's first entry
+    int32_t* first = cnt + n_expert;
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
         int c = 0;
         for (int i = 0; i < n; ++i) c += ids[i] == e;
@@ -188,22 +189,27 @@ __global__ void group_experts_kernel(const int32_t* __restrict__ ids, int n, int
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        int at = 0, g = 0;
-        for (int e = 0; e < n_expert; ++e) {
-            start[e] = at;
-            if (cnt[e]) {
-                grp_ptr[g] = (unsigned long long) (uintptr_t) base + (unsigned long long) e * blob;
-                grp_start[g] = at;
+        int at = 0;
+        for (int c = 0; c < n_class; ++c) {
+            unsigned long long* gp = grp_ptr + (size_t) c * n_expert;
+            int32_t* gs = grp_start + (size_t) c * (n_expert + 1);
+            int g = 0;
+            for (int e = 0; e < n_expert; ++e) {
+                if (cls[e] != c || cnt[e] == 0) continue;
+                first[e] = at;
+                gp[g] = ptr[e];
+                gs[g] = at;
                 ++g;
+                at += cnt[e];
             }
-            at += cnt[e];
+            gs[g] = at;
+            n_groups[c] = g;
         }
-        grp_start[g] = at;
-        *n_groups = g;
     }
     __syncthreads();
     for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
-        int at = start[e];
+        if (cnt[e] == 0) continue;
+        int at = first[e];
         for (int i = 0; i < n; ++i)
             if (ids[i] == e) {
                 ent_dst[at] = i;
@@ -264,11 +270,11 @@ void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* 
         q, k, v, r, q_scale, r_scale, a, pos0, (__half*) k_cache, (__half*) v_cache, cells);
 }
 
-void group_experts(const int32_t* ids, int rows, int k, int n_expert, const uint8_t* base, uint64_t blob_bytes,
-                   unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok,
+void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* expert_ptr, const int32_t* expert_class,
+                   int n_class, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok,
                    void* stream) {
-    group_experts_kernel<<<1, 128, (size_t) (2 * n_expert + 1) * sizeof(int32_t), (cudaStream_t) stream>>>(
-        ids, rows * k, n_expert, base, blob_bytes, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, k);
+    group_experts_kernel<<<1, 128, (size_t) (2 * n_expert) * sizeof(int32_t), (cudaStream_t) stream>>>(
+        ids, rows * k, n_expert, expert_ptr, expert_class, n_class, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, k);
 }
 
 void sum_experts(const float* out, const float* w, int rows, int k, int n_embd, float* y, void* stream) {
