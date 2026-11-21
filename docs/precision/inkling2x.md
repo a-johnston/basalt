@@ -12,15 +12,19 @@ Wikitext-2, 100 chunks of 512, rows 256 to 510 of each chunk (25,500 rows), one-
 | Pack | Size | PPL | ln(PPL/base) | KLD mean | KLD median | KLD p99 | KLD max | Same top-1 |
 |---|---|---|---|---|---|---|---|---|
 | SAGE REXL3 2.92 bpw | 10.0 GiB | 7.2173 ± 0.1112 | 0.0214 | 0.0297 | 0.0125 | 0.295 | 2.62 | 92.88% |
+| SAGE REXL3 2.26 bpw | 8.3 GiB | 7.4965 ± 0.1156 | 0.0593 | 0.0749 | 0.0316 | 0.792 | 4.54 | 89.35% |
 | InterpreticAI IQ3_XXS | 10.9 GiB | 7.4014 ± 0.1133 | 0.0465 | 0.0658 | 0.0368 | 0.480 | 9.66 | 88.79% |
 
-Base PPL 7.0649 on the scored rows. The REXL3 pack is 0.9 GiB smaller and has less than half the mean KLD. The two packs
-split their bytes differently: REXL3 has 7.9 GiB of experts and 2.1 GiB of other tensors, IQ3_XXS 10.1 GiB of experts and far
-coarser attention projections ([stages](#where-each-stage-rounds)).
+Base PPL 7.0649 on the scored rows. The 2.92 bpw pack is 0.9 GiB smaller than IQ3_XXS and has less than half its mean KLD;
+the 2.26 bpw pack is 2.6 GiB smaller at 14% more. The packs split their bytes differently: the REXL3 packs hold 7.9 or 6.1 GiB of
+experts and 2.1 GiB of other tensors, IQ3_XXS 10.1 GiB of experts and far coarser attention projections
+([stages](#where-each-stage-rounds)).
 
-The [SAGE card](https://huggingface.co/vcruz305/Inkling-2-Mini-SAGE-REXL3-2.92bpw) reports a mean KLD of 0.0196 and 96.33% top-1
-agreement against the official checkpoint in float64. It does not name its text, context length or scored positions, so its
-figures and this gate's are not comparable. This gate's base is llama.cpp's BF16 conversion of that checkpoint.
+The SAGE cards report mean KLD 0.0196 and 96.33% top-1 for
+[2.92 bpw](https://huggingface.co/vcruz305/Inkling-2-Mini-SAGE-REXL3-2.92bpw), 0.0475 and 94.66% for
+[2.26 bpw](https://huggingface.co/vcruz305/Inkling-2-Mini-SAGE-REXL3-2.26bpw), against the official
+checkpoint in float64. They do not name the text, context length or scored positions, so their figures and this gate's are not
+comparable. This gate's base is llama.cpp's BF16 conversion of that checkpoint.
 
 The IQ3_XXS pack keeps the GGUF's bytes. Against llama.cpp on the same weights it scores KLD 0.0033 and 97.80% top-1, and its
 greedy output matches llama.cpp's for 60 tokens.
@@ -29,7 +33,7 @@ greedy output matches llama.cpp's for 60 tokens.
 
 | Stage | REXL3 pack | IQ3_XXS pack | Arithmetic |
 |---|---|---|---|
-| Routed experts | EXL3 mul1, 2 to 4 bpw per expert (gate and up share a rate) | IQ3_XXS gate/up, IQ4_NL down | EXL3: fp32 activations through the Hadamard transforms; IQ: q8_1 activations; fp32 accumulation |
+| Routed experts | EXL3 mul1, 1.5 to 4 bpw per expert (gate and up share a rate) | IQ3_XXS gate/up, IQ4_NL down | EXL3: fp32 activations through the Hadamard transforms; IQ: q8_1 activations; fp32 accumulation |
 | Attention projections, gate | EXL3 5 bpw, computed in double and stored once as Q8_0 | IQ2_S (Q, K), IQ3_XXS (V, R, gate), IQ3_S (output) | q8_1 activations, fp32 accumulation |
 | Sinks, convolution input taps | Q8_0 of the BF16 values | IQ3_XXS | q8_1 activations |
 | Output head | EXL3 6 bpw, computed in double and stored once as Q8_0 | Q5_K | q8_1 activations, fp32 logits, soft cap 30 |
