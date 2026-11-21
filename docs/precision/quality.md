@@ -31,6 +31,7 @@ Every score is against the original model in BF16:
 | Qwen3.8-27B | unsloth's BF16 GGUF through `llama-perplexity` (llama.cpp 5676dfbe), wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192` | 6.7437 (6.7411 on the scored rows) |
 | Hy4-flash | Tencent's BF16 checkpoint converted to a BF16 GGUF (llama.cpp 0a054d0b0), through `llama-perplexity` with the llama.cpp port's Engram gate norm epsilon set to FP32's (#556) and `add_bos_token=true`, wikitext-2, 100 chunks of 512; `hy4flash-bf16-base.kld` | 18.416 (over the 25,500 scored rows) |
 | Inkling 2 Mini | the official release with its experts dequantized to BF16 (no BF16 checkpoint exists; the release ships NVFP4 and MXFP8 experts): a BF16 GGUF from `convert_hf_to_gguf --outtype bf16` (llama.cpp 29b52d398), through `llama-perplexity`, wikitext-2, 100 chunks of 512, `-b 8192 -ub 8192`; `inkling2-bf16-base.kld`. Not comparable with the other models' true-BF16 bases | 7.0714 |
+| Inkling 2 Mini (`inkling2x` packs) | the official checkpoint converted to a BF16 GGUF (llama.cpp eb550aaa5), through `llama-perplexity` with the experts in RAM and `--no-op-offload`, wikitext-2, 100 chunks of 512; `inkling2x-bf16-base.kld` | 7.0729 (7.0649 on the scored rows) |
 
 The official Flash-Next packs are scored against the first base on their
 [Hugging Face card](https://huggingface.co/jesdga/Qwen3.8-Flash-Next-Basalt#quality). That gate is 100 chunks, T 3, int8 KV, resident
