@@ -75,7 +75,9 @@ From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoi
 From an EXL3 checkpoint (--sections-from with --exl3)
   --exl3 DIR         an ExLlamaV3 EXL3 checkpoint of the model (config.json and the model-NNNNN-of-NNNNN shards). The
                      routed experts keep their trellis words and fp16 scale vectors (tools/convert/exl3_checkpoint.py).
-                     Every other language-model tensor is computed from its EXL3 form in double and stored once in
+                     Inkling 2 keeps each expert's rates, stores the projections and head as Q8_0, embedding as BF16
+                     and other tensors as F32; only GGUF metadata and tokenizer come from BASE. For Flash-Next,
+                     every other language-model tensor is computed from its EXL3 form in double and stored once in
                      the form the engine reads: projections and shared experts as Q6_K (Q8_0 where rows are not whole
                      256-value blocks), output head and token embedding as Q8_0, the rest BF16, F32 or F16 as in the
                      NVFP4 conversion. The n-gram table is the checkpoint's ngram_embedding.safetensors when DIR holds
@@ -778,6 +780,8 @@ def from_exl3(a) -> None:
         die(f"missing input: {src}")
     base = ModelFile(str(src))
     base_meta = json.loads(base.read("meta"))
+    if base_meta.get("arch") == "inkling2x":
+        return from_exl3_inkling2x(a, base, base_meta)
     q6k = not a.dense_q8_0
     try:
         ck = E.Exl3Checkpoint(a.exl3)
@@ -900,6 +904,86 @@ def from_exl3(a) -> None:
                 "sections_from": {"path": src.name, "size": src.stat().st_size,
                                   "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
                                   "copied": copied + ["gguf_kv"]}}
+            job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        w.close()
+        ok = True
+    except S.ConvertError as e:
+        die(str(e))
+    finally:
+        if not ok:
+            try:
+                w.f.close()
+            except OSError:
+                pass
+            partial.unlink(missing_ok=True)
+    os.replace(partial, out)
+    print(f"done: {len(job.rows)} sections, {out.stat().st_size / (1 << 30):.3f} GiB, {time.time() - job.t0:.1f} s -> {out}")
+
+
+def from_exl3_inkling2x(a, base: ModelFile, base_meta: dict) -> None:
+    """Inkling 2 from an EXL3 checkpoint (tools/convert/exl3_inkling2x.py): the experts at their own bitrates, every other
+    tensor under BASE's names and shapes; BASE's tokenizer and GGUF metadata."""
+    import multiprocessing
+    import exl3_checkpoint as E
+    import exl3_inkling2x as I
+    out, src = Path(a.out), Path(a.sections_from)
+    partial = Path(str(out) + ".partial")
+    if a.dense_q8_0:
+        die("an Inkling 2 pack from EXL3 stores its projections as Q8_0 already; drop --dense-q8-0")
+    try:
+        ck = E.Exl3Checkpoint(a.exl3)
+        model = I.Inkling2Exl3(ck, base_meta.get("tensors", {}), base_meta.get("geometry", {}))
+    except S.ConvertError as e:
+        die(str(e))
+    if partial.exists():
+        partial.unlink()
+    w = ModelWriter(str(partial))
+    job = Job(w)
+    copied = [n for n in base.names() if n.startswith("tokenizer/")]
+    ok = False
+    try:
+        with multiprocessing.Pool(a.workers) as pool:
+            print("writing sections:", flush=True)
+            for name in copied:
+                off, size = base.section(name)
+                job.file(name, src, off, size)
+            t = time.time()
+            parts = [Stream(x.nbytes(), model.chunks(x, pool)) if x.kind == "exl3" else model.bytes(x) for x in model.tensors]
+            offs = w.add_parts("gguf", parts, TENSOR_ALIGN)
+            job._report("gguf", w.entries[-1][2], time.time() - t)
+            job.chunks("experts", model.expert_chunks(pool))
+            if w.entries[-1][2] != model.total:
+                die("the experts section is not the size its layout says")
+            job.bytes("experts.layout", model.layout_text())
+            for name, _, _, digest in w.entries:
+                if name in copied and digest != base.sections[name][2]:
+                    die(f"section {name}: the copy's SHA-256 differs from {src}'s")
+            tensors = {x.name: {"type": x.type_name, "type_id": x.type_id, "shape": x.ne, "bytes": x.nbytes(), "offset": o}
+                       for x, o in zip(model.tensors, offs)}
+            kv = dict(base_meta.get("gguf_kv", {}))
+            kv["general.file_type"] = 7
+            if a.name:
+                kv["general.name"] = a.name
+            meta = {k: v for k, v in base_meta.items() if k not in ("tensors", "conversions", "sources", "exl3", "sections_from")}
+            meta["name"] = a.name or f"Inkling-2-Mini {Path(a.exl3).name}"
+            meta["vision"] = meta["mtp"] = None
+            meta["sources"] = [{"path": p.name, "size": p.stat().st_size,
+                                "fingerprint_sha256_first_last_64mib_and_size": fingerprint(p)} for p in ck.shards]
+            meta["gguf_kv"] = kv
+            meta["tensors"] = tensors
+            meta["conversions"] = {"compat_bf16": False, "tensors": []}
+            meta["exl3"] = {
+                "dir": Path(a.exl3).name,
+                "config_sha256": hashlib.sha256((ck.dir / "config.json").read_bytes()).hexdigest(),
+                "experts": {"format": "exl3 mul1", "source": "trellis (int16 tiles), suh, svh (fp16)",
+                            "repack": "trellis words unchanged, tiles reordered output-major; vectors unchanged",
+                            "rates gate-up/down bpw -> experts": model.rates},
+                "dense": {"from": "the EXL3 weight diag(suh) H inner H diag(svh) in double, stored once as Q8_0; the BF16 "
+                                  "projections the engine multiplies as Q8_0; the token embedding as BF16; the rest as F32",
+                          "q8_0_method": DENSE_METHODS["q8_0_method"]},
+                "sections_from": {"path": src.name, "size": src.stat().st_size,
+                                  "fingerprint_sha256_first_last_64mib_and_size": fingerprint(src),
+                                  "copied": copied + ["gguf_kv", "geometry"]}}
             job.bytes("meta", json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         w.close()
         ok = True
