@@ -30,7 +30,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
                                                                  float* __restrict__ ws) {
     const int row = blockIdx.x, h = blockIdx.y, split = blockIdx.z;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    extern __shared__ float tab[];   // [extent + 1] the bias by distance, minus the sink
+    __shared__ float tab[kSplit];   // the bias minus the sink by distance, over this split's distances (capped at extent)
     __shared__ float wm[kWarps], wl[kWarps], wacc[kWarps][kHead];
     const long long p = pos0 + row;
     const long long lo = key_lo(p, a.window) + (long long) split * kSplit;
@@ -44,11 +44,13 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
     }
     const float* rq = r + ((size_t) row * a.n_head + h) * a.d_rel;
     const float sink = sinks[(size_t) row * a.n_head + h];
-    for (int e = threadIdx.x; e <= a.extent; e += blockDim.x) {
+    const long long t0 = p - hi < a.extent ? p - hi : a.extent, t1 = p - lo < a.extent ? p - lo : a.extent;   // at most kSplit apart
+    for (int i = threadIdx.x; i <= t1 - t0; i += blockDim.x) {
+        const long long e = t0 + i;
         float t = 0.0f;
         if (e < a.extent)
-            for (int i = 0; i < a.d_rel; ++i) t += rel_bias[(size_t) e * a.d_rel + i] * rq[i];
-        tab[e] = t - sink;
+            for (int j = 0; j < a.d_rel; ++j) t += rel_bias[(size_t) e * a.d_rel + j] * rq[j];
+        tab[i] = t - sink;
     }
     const int g = h / (a.n_head / a.n_kv);
     const float* qh = q + ((size_t) row * a.n_head + h) * kHead;
@@ -64,7 +66,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
         float dot = qv[0] * __low2float(k01) + qv[1] * __high2float(k01) + qv[2] * __low2float(k23) + qv[3] * __high2float(k23);
         dot = warp_sum(dot);
         const long long d = p - j;
-        const float s = dot * scale + tab[d < a.extent ? d : a.extent];
+        const float s = dot * scale + tab[(d < a.extent ? d : a.extent) - t0];
         const float mn = fmaxf(m, s);
         const float c = expf(m - mn), e = expf(s - mn);
         const __half* vr = vc + (cell * a.n_kv + g) * kHead + lane * 4;
@@ -126,8 +128,7 @@ void attention(const float* q, const float* r, const float* sinks, const float* 
     const int64_t keys = a.window > 0 && p_last + 1 > a.window ? a.window : p_last + 1;
     const int nsplit = splits_of(keys);
     cudaStream_t st = (cudaStream_t) stream;
-    attn_split_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head, (unsigned) nsplit), kWarps * 32, (size_t) (a.extent + 1) * sizeof(float),
-                        st>>>(q, r, sinks, rel_bias, (const __half*) k_cache, (const __half*) v_cache, a, pos0, rows, nsplit,
+    attn_split_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head, (unsigned) nsplit), kWarps * 32, 0, st>>>(q, r, sinks, rel_bias, (const __half*) k_cache, (const __half*) v_cache, a, pos0, rows, nsplit,
                               (float*) ws);
     attn_join_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head), kHead, 0, st>>>((const float*) ws, gate, a.n_head, rows, nsplit, out);
 }

@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace basalt::models::inkling2x::kernels {
@@ -27,25 +28,50 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
 }
 
 // ---------------------------------------------------------------------------------------------------------- depth mix
-__global__ void depth_mix_kernel(States s, const float* __restrict__ queries, int rows, int E, float eps, float* __restrict__ out) {
-    const int r = blockIdx.x, qi = blockIdx.y;
-    __shared__ float red[32], inv[kMaxStates], p[kMaxStates];
+// A block per row, query and slice of the output. The scores need every value of the states, so each block sums all of them
+// in one pass (the same threads over the same values whatever the slice, so a row's output does not depend on the slicing);
+// the slices spread a short run of rows over more of the card.
+constexpr int kMixThreads = 256;
+
+__global__ void __launch_bounds__(kMixThreads) depth_mix_kernel(States s, const float* __restrict__ queries, int rows, int E, float eps,
+                                                                int slice, float* __restrict__ out) {
+    const int r = blockIdx.x, qi = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ float part[kMixThreads / 32][2 * kMaxStates], inv[kMaxStates], p[kMaxStates];
     const float* q = queries + (size_t) qi * E;
-    for (int i = 0; i < s.n; ++i) {
-        const float* x = s.p[i] + (size_t) r * E;
-        float ss = 0.0f, d = 0.0f;
-        for (int e = threadIdx.x; e < E; e += blockDim.x) {
-            const float v = x[e];
-            ss += v * v;
-            d += v * q[e];
+    float ss[kMaxStates], d[kMaxStates];
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i) ss[i] = d[i] = 0.0f;
+    for (int e = threadIdx.x; e < E; e += kMixThreads) {
+        const float qe = q[e];
+#pragma unroll
+        for (int i = 0; i < kMaxStates; ++i)
+            if (i < s.n) {
+                const float v = s.p[i][(size_t) r * E + e];
+                ss[i] += v * v;
+                d[i] += v * qe;
+            }
+    }
+#pragma unroll
+    for (int i = 0; i < kMaxStates; ++i)
+        if (i < s.n) {
+            ss[i] = warp_sum(ss[i]);
+            d[i] = warp_sum(d[i]);
+            if (lane == 0) {
+                part[warp][2 * i] = ss[i];
+                part[warp][2 * i + 1] = d[i];
+            }
         }
-        ss = block_sum(ss, red);
-        d = block_sum(d, red);
-        if (threadIdx.x == 0) {
-            const float iv = 1.0f / sqrtf(ss / (float) E + eps);
-            inv[i] = iv;
-            p[i] = d * iv / sqrtf((float) E);
+    __syncthreads();
+    if (threadIdx.x < s.n) {
+        const int i = threadIdx.x;
+        float a = 0.0f, b = 0.0f;
+        for (int w = 0; w < kMixThreads / 32; ++w) {
+            a += part[w][2 * i];
+            b += part[w][2 * i + 1];
         }
+        const float iv = 1.0f / sqrtf(a / (float) E + eps);
+        inv[i] = iv;
+        p[i] = b * iv / sqrtf((float) E);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -56,7 +82,8 @@ __global__ void depth_mix_kernel(States s, const float* __restrict__ queries, in
     }
     __syncthreads();
     float* o = out + ((size_t) qi * rows + r) * E;
-    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    const int e1 = min(E, (int) (blockIdx.z + 1) * slice);
+    for (int e = (int) blockIdx.z * slice + threadIdx.x; e < e1; e += kMixThreads) {
         float acc = 0.0f;
         for (int i = 0; i < s.n; ++i) acc += p[i] * (s.p[i][(size_t) r * E + e] * inv[i]);
         o[e] = acc;
@@ -64,48 +91,64 @@ __global__ void depth_mix_kernel(States s, const float* __restrict__ queries, in
 }
 
 // ---------------------------------------------------------------------------------------------------- loop controllers
-// g[r][o] = D[o] . [rms(cur); rms(msg)]: a warp per output, eight a block
-__global__ void control_down_kernel(const float* __restrict__ cur, const float* __restrict__ msg, const float* __restrict__ D, int E,
-                                    int rank, float eps, float* __restrict__ g) {
-    const int r = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    __shared__ float red[32], inv[2];
+// g[r][o] = D[o] . [rms(cur); rms(msg)]: a block per output and row, the norms' sums taken in the same pass as the products
+// (the norm is a factor of each half: g = (D_a . a) inv_a + (D_b . b) inv_b)
+constexpr int kCtlThreads = 256;
+
+__global__ void __launch_bounds__(kCtlThreads) control_down_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
+                                                                   const float* __restrict__ D, int E, int rank, float eps,
+                                                                   float* __restrict__ g) {
+    const int o = blockIdx.x, r = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ float part[kCtlThreads / 32][4];
     const float* a = cur + (size_t) r * E;
     const float* b = msg + (size_t) r * E;
-    float sa = 0.0f, sb = 0.0f;
-    for (int e = threadIdx.x; e < E; e += blockDim.x) {
-        sa += a[e] * a[e];
-        sb += b[e] * b[e];
+    const float* w = D + (size_t) o * 2 * E;
+    float sa = 0.0f, sb = 0.0f, da = 0.0f, db = 0.0f;
+    for (int e = threadIdx.x; e < E; e += kCtlThreads) {
+        const float av = a[e], bv = b[e];
+        sa += av * av;
+        sb += bv * bv;
+        da += w[e] * av;
+        db += w[E + e] * bv;
     }
-    sa = block_sum(sa, red);
-    sb = block_sum(sb, red);
-    if (threadIdx.x == 0) {
-        inv[0] = 1.0f / sqrtf(sa / (float) E + eps);
-        inv[1] = 1.0f / sqrtf(sb / (float) E + eps);
+    sa = warp_sum(sa);
+    sb = warp_sum(sb);
+    da = warp_sum(da);
+    db = warp_sum(db);
+    if (lane == 0) {
+        part[warp][0] = sa;
+        part[warp][1] = sb;
+        part[warp][2] = da;
+        part[warp][3] = db;
     }
     __syncthreads();
-    const int o = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (o >= rank) return;
-    const float* w = D + (size_t) o * 2 * E;
-    float acc = 0.0f;
-    for (int e = lane; e < E; e += 32) acc += w[e] * (a[e] * inv[0]) + w[E + e] * (b[e] * inv[1]);
-    acc = warp_sum(acc);
-    if (lane == 0) g[(size_t) r * rank + o] = acc;
+    if (threadIdx.x == 0) {
+        float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int w8 = 0; w8 < kCtlThreads / 32; ++w8)
+            for (int j = 0; j < 4; ++j) t[j] += part[w8][j];
+        g[(size_t) r * rank + o] = t[2] * (1.0f / sqrtf(t[0] / (float) E + eps)) + t[3] * (1.0f / sqrtf(t[1] / (float) E + eps));
+    }
 }
 
-__global__ void control_out_kernel(const float* __restrict__ cur, const float* __restrict__ msg, const float* __restrict__ G,
-                                   const float* __restrict__ F, const float* __restrict__ g, int E, int rank, float* __restrict__ out) {
-    const int r = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
-    extern __shared__ float gs[];
-    for (int i = threadIdx.x; i < rank; i += blockDim.x) gs[i] = g[(size_t) r * rank + i];
-    __syncthreads();
+// out[r][e] = cur - tanh(F[e] . g) cur + tanh(G[e] . g) msg: a warp per value, its lanes over the rank (G and F rows contiguous)
+__global__ void __launch_bounds__(kCtlThreads) control_out_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
+                                                                  const float* __restrict__ G, const float* __restrict__ F,
+                                                                  const float* __restrict__ g, int E, int rank, float* __restrict__ out) {
+    const int r = blockIdx.y, lane = threadIdx.x & 31, e = blockIdx.x * (kCtlThreads / 32) + (threadIdx.x >> 5);
     if (e >= E) return;
+    const float* gr = g + (size_t) r * rank;
     float ga = 0.0f, fo = 0.0f;
-    for (int i = 0; i < rank; ++i) {
-        ga += G[(size_t) e * rank + i] * gs[i];
-        fo += F[(size_t) e * rank + i] * gs[i];
+    for (int i = lane; i < rank; i += 32) {
+        const float gi = gr[i];
+        ga += G[(size_t) e * rank + i] * gi;
+        fo += F[(size_t) e * rank + i] * gi;
     }
-    const float c = cur[(size_t) r * E + e], m = msg[(size_t) r * E + e];
-    out[(size_t) r * E + e] = (c - tanhf(fo) * c) + tanhf(ga) * m;
+    ga = warp_sum(ga);
+    fo = warp_sum(fo);
+    if (lane == 0) {
+        const float c = cur[(size_t) r * E + e], m = msg[(size_t) r * E + e];
+        out[(size_t) r * E + e] = (c - tanhf(fo) * c) + tanhf(ga) * m;
+    }
 }
 
 // ----------------------------------------------------------------------------------------------- short convolutions
@@ -174,43 +217,55 @@ __global__ void qkvr_prep_kernel(float* __restrict__ q, const float* __restrict_
 }
 
 // ----------------------------------------------------------------------------------------------- the routed experts
-// One block, a thread per expert: each counts its entries; then the groups are laid out in expert order, and
+// One block, a thread per expert: each counts its entries, a scan over the block lays the groups out in expert order, and
 // each expert writes its entries in row order.
 __global__ void group_experts_kernel(const int32_t* __restrict__ ids, int n, int n_expert, const unsigned long long* __restrict__ ptr,
                                      const Exl3Rates* __restrict__ rates, unsigned long long* __restrict__ grp_ptr, Exl3Rates* __restrict__ grp_rates,
                                      int32_t* __restrict__ grp_start, int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
                                      int32_t* __restrict__ ent_tok, int k) {
-    extern __shared__ int32_t cnt[];   // [n_expert] counts, then [n_expert] each expert's first entry
-    int32_t* first = cnt + n_expert;
-    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
-        int c = 0;
+    __shared__ int wc[32], wp[32];
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = blockDim.x >> 5;
+    int c = 0;
+    if (e < n_expert)
         for (int i = 0; i < n; ++i) c += ids[i] == e;
-        cnt[e] = c;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        int at = 0, g = 0;
-        for (int e = 0; e < n_expert; ++e) {
-            if (cnt[e] == 0) continue;
-            first[e] = at;
-            grp_ptr[g] = ptr[e];
-            if (rates) grp_rates[g] = rates[e];
-            grp_start[g++] = at;
-            at += cnt[e];
+    const int has = c > 0;
+    int sc = c, sp = has;   // inclusive scans over the warp
+    for (int o = 1; o < 32; o <<= 1) {
+        const int tc = __shfl_up_sync(0xffffffffu, sc, o), tp = __shfl_up_sync(0xffffffffu, sp, o);
+        if (lane >= o) {
+            sc += tc;
+            sp += tp;
         }
-        grp_start[g] = at;
-        *n_groups = g;
+    }
+    if (lane == 31) {
+        wc[warp] = sc;
+        wp[warp] = sp;
     }
     __syncthreads();
-    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
-        if (cnt[e] == 0) continue;
-        int at = first[e];
+    int at = sc - c, gi = sp - has;
+    for (int w = 0; w < warp; ++w) {
+        at += wc[w];
+        gi += wp[w];
+    }
+    if (has) {
+        grp_ptr[gi] = ptr[e];
+        if (rates) grp_rates[gi] = rates[e];
+        grp_start[gi] = at;
         for (int i = 0; i < n; ++i)
             if (ids[i] == e) {
                 ent_dst[at] = i;
                 ent_tok[at] = i / k;
                 ++at;
             }
+    }
+    if (e == 0) {
+        int tc = 0, tg = 0;
+        for (int w = 0; w < nw; ++w) {
+            tc += wc[w];
+            tg += wp[w];
+        }
+        grp_start[tg] = tc;
+        *n_groups = tg;
     }
 }
 
@@ -232,15 +287,20 @@ __global__ void cap_logits_kernel(const float* __restrict__ x, int ld, int n_voc
 
 void depth_mix(const States& s, const float* queries, int nq, int rows, int n_embd, float eps, float* out, void* stream) {
     if (rows <= 0) return;
-    depth_mix_kernel<<<dim3((unsigned) rows, (unsigned) nq), 256, 0, (cudaStream_t) stream>>>(s, queries, rows, n_embd, eps, out);
+    // about 128 blocks for a short run of rows, a block per row and query for a long one
+    const int whole = (n_embd + kMixThreads - 1) / kMixThreads;
+    const int nslice = std::max(1, std::min(whole, (128 + rows * nq - 1) / (rows * nq)));
+    const int slice = (whole + nslice - 1) / nslice * kMixThreads;
+    depth_mix_kernel<<<dim3((unsigned) rows, (unsigned) nq, (unsigned) ((n_embd + slice - 1) / slice)), kMixThreads, 0, (cudaStream_t) stream>>>(
+        s, queries, rows, n_embd, eps, slice, out);
 }
 
 void loop_control(const float* cur, const float* msg, const float* down, const float* gain, const float* forget, int rows, int n_embd,
                   int rank, float eps, float* g, float* out, void* stream) {
     if (rows <= 0) return;
     cudaStream_t st = (cudaStream_t) stream;
-    control_down_kernel<<<dim3((unsigned) ((rank + 7) / 8), (unsigned) rows), 256, 0, st>>>(cur, msg, down, n_embd, rank, eps, g);
-    control_out_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) rows), 256, (size_t) rank * sizeof(float), st>>>(
+    control_down_kernel<<<dim3((unsigned) rank, (unsigned) rows), kCtlThreads, 0, st>>>(cur, msg, down, n_embd, rank, eps, g);
+    control_out_kernel<<<dim3((unsigned) ((n_embd + kCtlThreads / 32 - 1) / (kCtlThreads / 32)), (unsigned) rows), kCtlThreads, 0, st>>>(
         cur, msg, gain, forget, g, n_embd, rank, out);
 }
 
@@ -268,7 +328,7 @@ void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* 
 void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* expert_ptr, const Exl3Rates* expert_rates,
                    unsigned long long* grp_ptr, Exl3Rates* grp_rates, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok,
                    void* stream) {
-    group_experts_kernel<<<1, 128, (size_t) (2 * n_expert) * sizeof(int32_t), (cudaStream_t) stream>>>(
+    group_experts_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, (cudaStream_t) stream>>>(
         ids, rows * k, n_expert, expert_ptr, expert_rates, grp_ptr, grp_rates, grp_start, n_groups, ent_dst, ent_tok, k);
 }
 
