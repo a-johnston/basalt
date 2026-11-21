@@ -192,16 +192,13 @@ void test_draft_loop() {
 
 void test_flags() {
     program::CommonOptions o;
-    char a0[] = "x", a1[] = "--spec", a2[] = "4", a3[] = "--spec-oracle", a4[] = "t.txt", a5[] = "--draft-log", a6[] = "d.log",
-         a7[] = "--diag-teacher", a8[] = "--unknown";
-    char* argv[] = {a0, a1, a2, a3, a4, a5, a6, a7, a8};
+    char a0[] = "x", a1[] = "--spec", a2[] = "4", a3[] = "--spec-oracle", a4[] = "t.txt";
+    char* argv[] = {a0, a1, a2, a3, a4};
     int i = 1;
-    model::FlagArgs args(9, argv, i);
+    model::FlagArgs args(5, argv, i);
     CHECK(dfly_parse_flag("--spec", args, o) && o.spec == 4 && o.spec_given && i == 2);
     i = 3;
     CHECK(dfly_parse_flag("--spec-oracle", args, o) && o.spec_oracle == "t.txt");
-    i = 5;
-    CHECK(dfly_parse_flag("--draft-log", args, o));
     CHECK(dfly_parse_flag("--diag-teacher", args, o) && o.diag_teacher);
     CHECK(!dfly_parse_flag("--unknown", args, o));
     // no pack: a given --spec without an oracle is dropped, none stays 0

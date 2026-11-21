@@ -2,7 +2,6 @@
 // pack into the shared dense stack and hands out its sessions.
 #include "models/qwen35/adapter.hpp"
 
-#include "basalt/core/diag.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/prompt_stage.hpp"
@@ -652,7 +651,6 @@ public:
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
         else if (a == "--diag-split-at") o.diag_split_at = std::atoi(args.next("--diag-split-at"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
-        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;
     }

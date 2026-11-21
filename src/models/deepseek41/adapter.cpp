@@ -6,7 +6,6 @@
 #include "basalt/program/options.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
-#include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
@@ -87,7 +86,6 @@ public:
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
-        else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;
     }

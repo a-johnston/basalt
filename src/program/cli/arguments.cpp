@@ -2,6 +2,7 @@
 #include "help.hpp"
 #include "tokens.hpp"
 
+#include "basalt/core/diag.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/flags.hpp"
@@ -41,6 +42,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--diag-tier-ram") o.diag_tier_ram = std::atoi(next("--diag-tier-ram"));
         else if (a == "--diag-tier-vram") o.diag_tier_vram = std::atoi(next("--diag-tier-vram"));
         else if (a == "--diag-serial-prompt") o.diag_serial_prompt = true;
+        else if (a == "--draft-log") core::diagnostics().draft_log = next("--draft-log");
         else if (a == "--diag-logits") o.diag_logits = next("--diag-logits");
         else if (a == "--diag-batch-check") o.diag_batch_check = true;
         else if (a == "--image") o.images.push_back(next("--image"));

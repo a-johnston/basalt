@@ -263,7 +263,7 @@ bool dfly_draft_loop(int n, int32_t anchor,
                      int32_t* ids, float* conf, int& made);
 
 /// The flags a Hy4-flash start takes for speculative decoding, as DeepSeek's: --spec N, --spec-oracle FILE, --diag-teacher,
-/// --draft-log FILE. False when `a` is none of them.
+/// --diag-tier-frozen. False when `a` is none of them.
 bool dfly_parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o);
 /// With the pack's `dfly` section present --spec defaults to the whole block (6), else 0; a --spec of 2 or more without a
 /// drafter or an oracle file is dropped with a warning.

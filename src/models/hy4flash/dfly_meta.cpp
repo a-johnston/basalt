@@ -2,7 +2,6 @@
 // tensors it must hold, the draft loop, and the flags.
 #include "models/hy4flash/dfly.hpp"
 
-#include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
@@ -166,7 +165,6 @@ bool dfly_parse_flag(const std::string& a, model::FlagArgs& args, program::Commo
     } else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
     else if (a == "--diag-teacher") o.diag_teacher = true;
     else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
-    else if (a == "--draft-log") core::diagnostics().draft_log = args.next("--draft-log");
     else return false;
     return true;
 }
