@@ -23,6 +23,15 @@ class Fixtures(unittest.TestCase):
                 with self.subTest(dir=d.name, fixture=name):
                     self.assertTrue(all(i >= 0 for i in ids(d / f"{name}.ids")))
 
+    def test_inkling_fixtures_leave_the_model_role_to_be_generated(self):
+        for name in ("conv", "struct", "prose"):
+            with self.subTest(fixture=name):
+                t = ids(BENCH / "inkling2_loop" / f"{name}.ids")
+                self.assertEqual(t[:2], [200002, 200004])  # system text: thinking effort 0
+                self.assertIn([200010, 200000, 200004], [t[i:i+3] for i in range(len(t))])  # user text
+                self.assertEqual(t[-1], 200010)  # end of user message, not end of sampling
+                self.assertNotIn(200001, t)  # model role
+
     def test_deepseek_fixtures_end_at_the_generation_header(self):
         for name in ("conv", "struct", "prose"):
             with self.subTest(fixture=name):
