@@ -310,6 +310,10 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_INKLING2X)
+include(src/models/inkling2x/inkling2x.cmake)
+endif()
+
 if(BASALT_MODEL_DEEPSEEK41)
 add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models/deepseek41/tokenizer/pretok_joyai.cpp src/models/deepseek41/pack.cpp
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp

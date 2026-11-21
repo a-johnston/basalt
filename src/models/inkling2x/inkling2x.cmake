@@ -1,0 +1,10 @@
+# Inkling 2 Mini from GGUF and EXL3 packs (inkling2x): its kernels, the model, its tests.
+add_library(model_inkling2x STATIC src/models/inkling2x/adapter.cpp src/models/inkling2x/pretok_o200k.cpp src/models/inkling2x/model.cpp)
+target_include_directories(model_inkling2x PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+target_link_libraries(model_inkling2x PUBLIC model tokenizer core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  add_executable(inkling2x_pretok_test src/models/inkling2x/pretok_test.cpp src/models/inkling2x/pretok_o200k.cpp)
+  target_include_directories(inkling2x_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
+  target_link_libraries(inkling2x_pretok_test PRIVATE tokenizer)
+  basalt_cpu_test(NAME inkling2x_pretok_test COMMAND inkling2x_pretok_test)
+endif()
