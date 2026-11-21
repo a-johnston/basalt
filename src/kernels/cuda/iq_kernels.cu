@@ -3785,6 +3785,28 @@ __global__ void __launch_bounds__(256) swiglu_softcap_q8_1_entries_kernel(const 
     }
 }
 
+// situ, then the q8_1 blocks (the same pass as swiglu_q8_1_entries_kernel): beta * tanh(g / beta) * sigmoid(g) times
+// up_beta * tanh(u / up_beta) (u when up_beta is 0), in the order of llama.cpp's graph ops (a scale by the reciprocal,
+// tanhf, the products rounded one by one).
+template<bool PDL>
+__global__ void __launch_bounds__(256) situ_q8_1_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                                                const int32_t* __restrict__ grp_start,
+                                                                const int32_t* __restrict__ n_groups, int n_ff, float beta,
+                                                                float up_beta, block_q8_1* __restrict__ hq) {
+    if constexpr (PDL) pdl_trigger();
+    const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
+    if constexpr (PDL) pdl_wait();
+    const float inv_beta = 1.0f / beta, inv_up = up_beta > 0.0f ? 1.0f / up_beta : 0.0f;
+    for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
+         i += (long long) gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        const float a = __fmul_rn(beta, tanhf(__fmul_rn(g, inv_beta)));
+        const float s = 1.0f / (1.0f + expf(-g));
+        const float u = up_beta > 0.0f ? __fmul_rn(up_beta, tanhf(__fmul_rn(up[i], inv_up))) : up[i];
+        q8_1_store(__fmul_rn(__fmul_rn(a, s), u), hq, i);
+    }
+}
+
 enum class Act { Plain, Clamp, Softcap };
 
 // native_expert_grouped's body; ACT selects the activation at compile time, so the plain instantiation is the original
@@ -3796,6 +3818,10 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
                   int64_t grid_groups, [[maybe_unused]] float limit) {
     constexpr bool CLAMP = ACT == Act::Clamp;
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (L.situ_beta > 0.0f && (CLAMP || L.had_block > 0 || cpu::exl3_supported(L.gu_type))) {
+        basalt::log::error("basalt", "native_expert_grouped: situ is built for the q8_1 formats without a limit or a Hadamard fold");
+        std::exit(1);
+    }
     if (cpu::exl3_supported(L.gu_type)) {   // the activations are the tokens' float rows (native_expert_act_rows)
         exl3_expert_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, (const float*) x_q8_1,
                             scratch, out, stream, grid_groups);
@@ -3852,6 +3878,13 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
         else
             swiglu_softcap_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
                 gate, up, grp_start, n_groups, (int) L.n_ff, L.gate_softcap, L.up_softcap, hq);
+    } else if (L.situ_beta > 0.0f) {
+        if (chain)
+            launch_dependent(situ_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
+                             (const float*) up, grp_start, n_groups, (int) L.n_ff, L.situ_beta, L.situ_up, hq);
+        else
+            situ_q8_1_entries_kernel<false><<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(
+                gate, up, grp_start, n_groups, (int) L.n_ff, L.situ_beta, L.situ_up, hq);
     } else if constexpr (CLAMP) {
         if (chain)
             launch_dependent(swiglu_clamp_q8_1_entries_kernel<true>, dim3((unsigned) ((nh + 255) / 256)), s,

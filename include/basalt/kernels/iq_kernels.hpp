@@ -60,6 +60,9 @@ struct NativeExpertLayout {
     /// > 0: the softcapped SwiGLU instead, h = gate_softcap tanh(g / gate_softcap) sigmoid(g) up_softcap tanh(u / up_softcap)
     /// (the sigmoid sees the raw gate; the caps bound its linear factor and up). Both set together.
     float gate_softcap = 0.0f, up_softcap = 0.0f;
+    // > 0: the gated unit is situ instead of SwiGLU (Inkling 2): situ_beta * tanh(g / situ_beta) * sigmoid(g) times
+    // situ_up * tanh(u / situ_up) (or u when situ_up is 0). Not with swiglu_limit, a Hadamard fold or EXL3 types.
+    float situ_beta = 0.0f, situ_up = 0.0f;
     // APR (prism.hadamard): the down weights are Hadamard-folded, so native_expert_grouped rotates h before
     // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.
     int had_block = 0;
