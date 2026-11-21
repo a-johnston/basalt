@@ -1,4 +1,4 @@
-// src/program/tokenizer/unicode_flags.hpp - Unicode category flags of a code point, for the qwen35 pre-tokenizer.
+// src/program/tokenizer/unicode_flags.hpp - Unicode category flags of a code point, for the pre-tokenizers.
 #pragma once
 
 #include <cstddef>
@@ -12,6 +12,8 @@ enum CptFlag : uint16_t {
     kLetter = 0x0004,       // \p{L}
     kMark = 0x0010,         // \p{M}
     kWhitespace = 0x0100,   // \s
+    kUpper = 0x0200,        // \p{Lu} or \p{Lt}
+    kLower = 0x0400,        // \p{Ll}
 };
 
 inline // A stray or truncated byte stands for U+FFFD and consumes one byte.
