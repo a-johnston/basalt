@@ -224,12 +224,14 @@ __global__ void __launch_bounds__(kHad) exl3_in_kernel(const unsigned long long*
     split128(v, smax, xa, (size_t) m * cap + e, n_embd, b);
 }
 
-// h[e] = H (suh_d * silu(g) * u), split,  g = H (gate inner) * svh_g,  u = H (up inner) * svh_u.
-// Grid (n_ff / 128, cap).
+// h[e] = H (suh_d * silu(g) * u), split,  g = H (gate inner) * svh_g,  u = H (up inner) * svh_u.  With beta > 0 the
+// gated unit is situ instead (NativeExpertLayout::situ_beta): beta tanh(g / beta) sigmoid(g) up_beta tanh(u / up_beta), in
+// native_expert_grouped's order of operations.  Grid (n_ff / 128, cap).
 __global__ void __launch_bounds__(kHad) exl3_mid_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                         const int32_t* __restrict__ grp_start,
                                                         const int32_t* __restrict__ n_groups, const float* __restrict__ gu,
-                                                        ActRef ha, size_t vec_off, int n_embd, int n_ff, long long cap) {
+                                                        ActRef ha, size_t vec_off, int n_embd, int n_ff, long long cap,
+                                                        float beta, float up_beta) {
     __shared__ float sm[kHad];
     __shared__ float smax[4];
     pdl_launch_dependents();
@@ -240,7 +242,14 @@ __global__ void __launch_bounds__(kHad) exl3_mid_kernel(const unsigned long long
     const __half* vec = (const __half*) (grp_ptr[g] + vec_off);
     const float gv = fwht128(gu[(size_t) e * n_ff + i], sm) * __half2float(vec[n_embd + i]);
     const float uv = fwht128(gu[((size_t) cap + e) * n_ff + i], sm) * __half2float(vec[2 * n_embd + n_ff + i]);
-    const float h = (gv / (1.f + expf(-gv))) * uv;
+    float h;
+    if (beta > 0.f) {
+        const float a = __fmul_rn(beta, tanhf(__fmul_rn(gv, 1.f / beta)));
+        const float u = up_beta > 0.f ? __fmul_rn(up_beta, tanhf(__fmul_rn(uv, 1.f / up_beta))) : uv;
+        h = __fmul_rn(__fmul_rn(a, 1.f / (1.f + expf(-gv))), u);
+    } else {
+        h = (gv / (1.f + expf(-gv))) * uv;
+    }
     split128(fwht128(h * __half2float(vec[2 * (n_embd + n_ff) + i]), sm), smax, ha, (size_t) e, n_ff, blockIdx.x);
 }
 
@@ -630,7 +639,7 @@ void exl3_expert_grouped(const NativeExpertLayout& L, const unsigned long long* 
     RowsArgs a{grp_ptr, grp_start, n_groups, xa, gu, 0, L.up_off, (long long) cap_entries, 2, ne, nf};
     launch_rows(cpu::exl3_k2(L.gu_type), dim3((unsigned) (2 * nf / 16), gy), s, a);
     launch_pdl(exl3_mid_kernel, dim3((unsigned) (nf / kHad), ce), dim3(kHad), 0, s, grp_ptr, grp_start, n_groups,
-               (const float*) gu, ha, vec_off, ne, nf, (long long) cap_entries);
+               (const float*) gu, ha, vec_off, ne, nf, (long long) cap_entries, L.situ_beta, L.situ_up);
     RowsArgs d{grp_ptr, grp_start, n_groups, ha, dn, L.down_off, (size_t) 0, (long long) cap_entries, 1, nf, ne};
     launch_rows(cpu::exl3_k2(L.d_type), dim3((unsigned) (ne / 16), gy), s, d);
     launch_pdl(exl3_out_kernel, dim3((unsigned) (ne / kHad), ce), dim3(kHad), 0, s, grp_ptr, grp_start, n_groups, ent_dst,

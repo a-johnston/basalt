@@ -3818,8 +3818,8 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
                   int64_t grid_groups, [[maybe_unused]] float limit) {
     constexpr bool CLAMP = ACT == Act::Clamp;
     if (cap_groups <= 0 || cap_entries <= 0) return;
-    if (L.situ_beta > 0.0f && (CLAMP || L.had_block > 0 || cpu::exl3_supported(L.gu_type))) {
-        basalt::log::error("basalt", "native_expert_grouped: situ is built for the q8_1 formats without a limit or a Hadamard fold");
+    if (L.situ_beta > 0.0f && (CLAMP || L.had_block > 0)) {
+        basalt::log::error("basalt", "native_expert_grouped: situ is built without a SwiGLU limit or a Hadamard fold");
         std::exit(1);
     }
     if (cpu::exl3_supported(L.gu_type)) {   // the activations are the tokens' float rows (native_expert_act_rows)
