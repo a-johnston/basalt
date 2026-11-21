@@ -457,10 +457,11 @@ __device__ __forceinline__ void rows_body(const RowsArgs& a) {
 template<int K2, int NWARP>
 __global__ void __launch_bounds__(32 * NWARP) exl3_rows_kernel(RowsArgs a) { rows_body<K2, NWARP>(a); }
 
-// The all-rates kernel, held to three blocks an SM: its switch over every rate otherwise takes 250 registers (one block
-// an SM), where a single rate takes 64 to 80.
+// The all-rates kernel, held to four blocks an SM: its switch over every rate otherwise takes 250 registers (one block
+// an SM), where a single rate takes 64 to 80. At four it takes 64 and spills 388 bytes, and is still faster than three
+// (80 registers, 48 bytes spilled).
 template<int NWARP>
-__global__ void __launch_bounds__(32 * NWARP, 3) exl3_rows_all_kernel(RowsArgs a) { rows_body<0, NWARP>(a); }
+__global__ void __launch_bounds__(32 * NWARP, 4) exl3_rows_all_kernel(RowsArgs a) { rows_body<0, NWARP>(a); }
 
 // One 128 x 128 block (inputs kb, outputs nb) of a matrix in the original basis, a half of 64 outputs at a time in
 // shared memory, the Hadamard butterflies along the inputs and then along the outputs in the stage order of
