@@ -72,7 +72,7 @@ def dialect_for(arch: str | None) -> Dialect:
     if arch in ("hy4flash", "hy_v4_flash"):
         from serve.models.hy4flash import Hy4Flash
         return Hy4Flash()
-    if arch == "inkling2":
+    if arch in ("inkling2", "inkling2_loop"):   # inkling2_loop: a pack from a llama.cpp GGUF (inkling2x)
         from serve.models.inkling2 import Inkling2
         return Inkling2()
     if arch in ("qwen4exp", "qwen35", None):

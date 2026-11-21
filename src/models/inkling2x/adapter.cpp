@@ -19,9 +19,19 @@ public:
 
     model::TokenizerSpec tokenizer_spec() const override { return {"tokenizer.ggml.tokens", "inkling2"}; }
 
-    // Tool calls are messages of their own (<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}),
-    // which the parameter grammar of ToolForm does not describe: no tool grammar until it does.
-    program::grammar::ToolForm tool_form() const override { return {}; }
+    // A tool call is a message of its own, <|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{..}}
+    // <|end_message|>, opened by a name where a content tag would be: the form models/inkling2's adapter gives the same
+    // model and template, which the server's Inkling 2 dialect asks the grammar for.
+    program::grammar::ToolForm tool_form() const override {
+        program::grammar::ToolForm f;
+        f.call_open = "<|message_model|>";
+        f.fn_mid = "<|content_invoke_tool_json|>{\"name\":{name},\"args\":";
+        f.fn_close = "}";
+        f.call_close = "<|end_message|>";
+        f.json_args = true;
+        f.trigger_pattern = "<\\|message_model\\|>[^<]";
+        return f;
+    }
 
     PreTokenizer pretokenizer() const override { return {"inkling2", pretok_o200k}; }
     int max_expert_cards() const override { return 0; }
