@@ -226,8 +226,9 @@ struct Attn {
     std::vector<float> q, k, v, r, sink, gate, qs, rs, rb;
 };
 
-void check_attention(bool full) {
-    const int R = 3, W = full ? 0 : EXT;
+// R = 3 takes the decode's splits of the keys; R = 17 (past a decode window) a prompt chunk's
+void check_attention(bool full, int R) {
+    const int W = full ? 0 : EXT;
     const int64_t pos0 = full ? 1500 : 1200;   // past the window / past the bias extent
     const int64_t cells = full ? 16384 : W + 16;   // a full layer: a cell per position
     Attn h;
@@ -346,6 +347,10 @@ void check_attention(bool full) {
         }
     }
     const auto got = down(out, ref.size());
+    if (R > 16) {   // a row alone takes the decode's splits: not the same sums
+        report(full ? "attention, full layer, prompt splits" : "attention, sliding, prompt splits", got, ref, 1e-4);
+        return;
+    }
     report(full ? "attention, full layer (> extent)" : "attention, sliding (wrapped ring)", got, ref, 1e-4);
     float* one = zeros<float>((size_t) H * D);
     k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, 1, ws, one, nullptr);
@@ -605,8 +610,10 @@ int main(int argc, char** argv) {
     check_mix();
     check_control();
     check_conv();
-    check_attention(false);
-    check_attention(true);
+    check_attention(false, 3);
+    check_attention(true, 3);
+    check_attention(false, 17);
+    check_attention(true, 17);
     check_experts();
     check_exl3_experts();
     check_logits();

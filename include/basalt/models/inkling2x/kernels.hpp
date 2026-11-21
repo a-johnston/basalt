@@ -62,7 +62,8 @@ void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* 
 /// with d_j the distance back, T[e] = R . rel_bias[e] - sink (T[extent] = -sink): the bias and the sink are not scaled.
 /// Keys at d_j >= window are out (window 0: none). The softmax takes the scores and one more logit of 0. Out ([rows][n_head][128]) is the attention times
 /// sigmoid(gate) ([rows][n_head 128]). `rel_bias` is [extent][16]; `ws` is attention_workspace_bytes of scratch. `pos0` sizes the
-/// grid only: the keys are split in runs of 256, so a launch is good for every first position with the same split count.
+/// grid only: the keys are split in runs (64 keys for up to 16 rows, 256 above), so a launch is good for every first position
+/// with the same split count. The query heads of a K/V head (up to 8) share a block.
 struct AttnArgs {
     int n_head = 24, n_kv = 8, d_rel = 16, extent = 1024, window = 0;
     int64_t cells = 0;   ///< the caches' cells: position p in cell p % cells
@@ -71,8 +72,8 @@ size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys);
 void attention(const float* q, const float* r, const float* sinks, const float* gate, const float* rel_bias,
                const uint16_t* k_cache, const uint16_t* v_cache, const AttnArgs& a, const int64_t* pos, int64_t pos0, int rows,
                void* ws, float* out, void* stream);
-/// The split count of a launch whose last row is at p_last: equal counts can share a captured launch.
-int attention_splits(const AttnArgs& a, int64_t p_last);
+/// The split count of a launch of `rows` rows whose last is at p_last: equal counts can share a captured launch.
+int attention_splits(const AttnArgs& a, int64_t p_last, int rows);
 
 /// The routed experts of `rows` rows of k picks (`ids`, [rows][k]) as native_expert_grouped's groups. Expert e's blob is at
 /// `expert_ptr[e]`. One group per expert picked, in expert order; entries in row order. In a mixed-rate layer,

@@ -378,10 +378,10 @@ private:
         return aa;
     }
 
-    // The attention's split counts at a last position, full layers then sliding ones: a graph replays where they match.
+    // The attention's split counts of one row at p_last, full layers then sliding ones: a graph replays where they match.
     std::pair<int, int> splits_at(int64_t p_last) const {
         int full = 0, sliding = 0;
-        for (int l = 0; l < g_.n_layers; ++l) (g_.swa[(size_t) l] ? sliding : full) = ik::attention_splits(attn_args(l, l), p_last);
+        for (int l = 0; l < g_.n_layers; ++l) (g_.swa[(size_t) l] ? sliding : full) = ik::attention_splits(attn_args(l, l), p_last, 1);
         return {full, sliding};
     }
 
