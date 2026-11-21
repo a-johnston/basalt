@@ -29,7 +29,7 @@ from model_file import SECTION_ALIGN, TENSOR_ALIGN, ModelFile  # noqa: E402
 
 CHUNK = 64 << 20
 ROLES = ("gate", "up", "down")
-EXPERT = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+EXPERT = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down|gate_up)_exps\.weight$")
 
 
 def sha(view: np.ndarray) -> str:
@@ -116,20 +116,24 @@ def verify(pack: str, first_gguf: str, workers: int = 16) -> bool:
             if total != m.section(pre + "experts")[1]:
                 bad(f"{pre}experts.layout totals {total} bytes, the section is {m.section(pre + 'experts')[1]}")
             for l, (gt, dt, off, blob) in layers.items():
-                names = [f"blk.{l}.ffn_{r}_exps.weight" for r in ROLES]
+                fused = f"blk.{l}.ffn_gate_up_exps.weight"
+                # llama.cpp's fused gate_up (the gate's rows first) is the blob's [gate | up]
+                names = [fused, f"blk.{l}.ffn_down_exps.weight"] if fused in src.where else \
+                    [f"blk.{l}.ffn_{r}_exps.weight" for r in ROLES]
                 if any(n not in src.where for n in names):
                     bad(f"{pre}experts layer {l}: the source lacks {names}")
                     continue
                 ts = [src.where[n][1] for n in names]
                 per = [t.expected_bytes() // n_exp for t in ts]
-                if sum(per) != blob or (ts[0].type_id, ts[2].type_id) != (gt, dt) or off % 1:
+                if sum(per) != blob or (ts[0].type_id, ts[-1].type_id) != (gt, dt) or off % 1:
                     bad(f"{pre}experts layer {l}: layout {gt}/{dt}/{blob} does not match the source tensors")
-                role_off = [0, per[0], per[0] + per[1]]
+                role_off = [sum(per[:i]) for i in range(len(per))]
                 for n, ro, p in zip(names, role_off, per):
                     place(n, (pre + "experts", off, blob, n_exp, ro, p))
             n_in = sum(1 for n in src.where if EXPERT.match(n) and int(EXPERT.match(n).group(1)) in
                        {l for l in layers})
-            if n_in != 3 * len(layers):
+            n_roles = sum(2 if f"blk.{l}.ffn_gate_up_exps.weight" in src.where else 3 for l in layers)
+            if n_in != n_roles:
                 bad(f"{pre}experts: {len(layers)} layers listed, {n_in} source expert tensors of those layers")
     for pre in ("", "mtp/"):
         if pre + "dense.index" in m.sections:

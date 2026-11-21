@@ -362,15 +362,25 @@ class Experts:
         self.layout = []
         offset = 0
         for l in self.layers:
-            names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
+            fused = "blk.%d.ffn_gate_up_exps.weight" % l
+            if fused in T:
+                # llama.cpp's fused gate and up, the gate's rows first: an expert's slice is already [gate | up]
+                split = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ("gate", "up")]
+                if any(n in T for n in split):
+                    raise ConvertError("layer %d: both %s and a separate gate or up" % (l, fused))
+                names = [fused, "blk.%d.ffn_down_exps.weight" % l]
+            else:
+                names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
             if any(n not in T for n in names):
                 raise ConvertError("layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T)))
             ts = [T[n] for n in names]
             if any(t.expected_bytes() is None or len(t.shape) != 3 or int(t.shape[2]) != self.n_expert for t in ts):
                 raise ConvertError("layer %d: an expert tensor is not [*, *, %d] of whole blocks" % (l, self.n_expert))
+            if len(ts) == 2 and (int(ts[0].shape[1]) != 2 * int(ts[1].shape[0]) or int(ts[0].shape[0]) != int(ts[1].shape[1])):
+                raise ConvertError("layer %d: gate_up %s does not pair with down %s" % (l, list(ts[0].shape), list(ts[1].shape)))
             per = [t.expected_bytes() // self.n_expert for t in ts]
             blob = sum(per)
-            self.layout.append((l, ts[0].type_id, ts[2].type_id, offset, blob, names, ts[1].type_id))
+            self.layout.append((l, ts[0].type_id, ts[-1].type_id, offset, blob, names, ts[0].type_id if len(ts) == 2 else ts[1].type_id))
             offset += blob * self.n_expert
         self.total = offset
         meta = {}
@@ -379,7 +389,7 @@ class Experts:
                 meta.setdefault(k, v)
         t0 = [T[n] for n in self.layout[0][5]]
         # `experts.hadamard`: Hadamard-folded experts (`hadamard` in the layout's header), None for every other model
-        self.hadamard = hadamard_text(meta, self.layout, int(t0[0].shape[0]), int(t0[2].shape[0]))
+        self.hadamard = hadamard_text(meta, self.layout, int(t0[0].shape[0]), int(t0[-1].shape[0]))
 
     def layout_text(self) -> bytes:
         """v5; v7 (a sixth column, the up rows' type) only when a layer's gate and up differ in type, so every other
