@@ -140,7 +140,7 @@ target_link_libraries(artifact INTERFACE platform warnings)
 add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp src/model/route_flags.cpp src/model/start.cpp src/model/batch_check.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(model PUBLIC artifact warnings)
+target_link_libraries(model PUBLIC artifact core warnings)
 
 if(BASALT_MODEL_QWEN4EXP)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
