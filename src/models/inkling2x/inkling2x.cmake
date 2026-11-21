@@ -2,7 +2,8 @@
 add_library(inkling2x_kernels STATIC src/models/inkling2x/kernels/ops.cu src/models/inkling2x/kernels/attention.cu)
 target_include_directories(inkling2x_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2x_kernels PUBLIC ${_gpu_runtime_target})
-add_library(model_inkling2x STATIC src/models/inkling2x/adapter.cpp src/models/inkling2x/pretok_o200k.cpp src/models/inkling2x/model.cpp)
+add_library(model_inkling2x STATIC src/models/inkling2x/adapter.cpp src/models/inkling2x/pretok_o200k.cpp src/models/inkling2x/pack.cpp
+  src/models/inkling2x/model.cpp src/models/inkling2x/session.cpp)
 target_include_directories(model_inkling2x PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_inkling2x PUBLIC model tokenizer inkling2x_kernels kernels core ${_gpu_runtime_target})
 if(BUILD_TESTING)
