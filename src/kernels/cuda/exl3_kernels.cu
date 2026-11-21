@@ -426,7 +426,7 @@ __device__ void group_band(const uint32_t* tiles, const ActRef& x, int e0, int e
 // Grid (bands of every matrix, groups side by side), 32 NWARP threads: a block per band; a block row strides over
 // the groups past the grid's.
 template<int K2, int NWARP>
-__global__ void __launch_bounds__(32 * NWARP) exl3_rows_kernel(RowsArgs a) {
+__device__ __forceinline__ void rows_body(const RowsArgs& a) {
     __shared__ float part[NWARP][8][16];
     const int bands = a.n_out / 16, m = blockIdx.x / bands, band = blockIdx.x % bands, kt_n = a.n_in / 16;
     const ActRef xm{a.x.hi + (size_t) m * a.cap * a.n_in, a.x.lo + (size_t) m * a.cap * a.n_in,
@@ -453,6 +453,14 @@ __global__ void __launch_bounds__(32 * NWARP) exl3_rows_kernel(RowsArgs a) {
         }
     }
 }
+
+template<int K2, int NWARP>
+__global__ void __launch_bounds__(32 * NWARP) exl3_rows_kernel(RowsArgs a) { rows_body<K2, NWARP>(a); }
+
+// The all-rates kernel, held to three blocks an SM: its switch over every rate otherwise takes 250 registers (one block
+// an SM), where a single rate takes 64 to 80.
+template<int NWARP>
+__global__ void __launch_bounds__(32 * NWARP, 3) exl3_rows_all_kernel(RowsArgs a) { rows_body<0, NWARP>(a); }
 
 // One 128 x 128 block (inputs kb, outputs nb) of a matrix in the original basis, a half of 64 outputs at a time in
 // shared memory, the Hadamard butterflies along the inputs and then along the outputs in the stage order of
@@ -575,8 +583,9 @@ __global__ void __launch_bounds__(kDqT) exl3_dequant_kernel(DqArgs q) {
 template<int NWARP>
 void launch_rows_w(int k2, dim3 grid, cudaStream_t s, const RowsArgs& a) {
     switch (k2) {
+        case 0: launch_pdl(exl3_rows_all_kernel<NWARP>, grid, dim3(32 * NWARP), 0, s, a); break;
 #define X(K2) case K2: launch_pdl(exl3_rows_kernel<K2, NWARP>, grid, dim3(32 * NWARP), 0, s, a); break;
-        X(0) EXL3_RATES(X)
+        EXL3_RATES(X)
 #undef X
         default: basalt::log::error("basalt", "exl3_expert_grouped: bitrate %d/2", k2); std::exit(1);
     }
