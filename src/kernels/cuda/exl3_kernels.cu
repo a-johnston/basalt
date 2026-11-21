@@ -206,20 +206,31 @@ __device__ __forceinline__ void split128(float v, float* smax, const ActRef& a, 
     if (threadIdx.x == 0) a.inv[row * (size_t) (n / kHad) + blk] = amax > 0.f ? __uint_as_float((uint32_t) (127 + ex - 14) << 23) : 0.f;
 }
 
+// Each of the three trellises needs unit bytes per half bit; the scale vectors follow them.
+struct BlobVectors {
+    const Exl3Rates* rates;
+    size_t unit, uniform_offset;
+    __device__ size_t offset(int g) const {
+        if (!rates) return uniform_offset;
+        const Exl3Rates r = rates[g];
+        return unit * (2 * r.gu + r.down);
+    }
+};
+
 // x[m][e] = H (suh_m * x[tok[e]]) for the gate (m = 0) and the up (m = 1) matrix of entry e's expert, split.
 // Grid (2 n_embd / 128, cap), 128 threads.
 __global__ void __launch_bounds__(kHad) exl3_in_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                        const int32_t* __restrict__ grp_start,
                                                        const int32_t* __restrict__ n_groups,
                                                        const int32_t* __restrict__ ent_tok, const float* __restrict__ x,
-                                                       ActRef xa, size_t vec_off, int n_embd, int n_ff, long long cap) {
+                                                       ActRef xa, BlobVectors vecs, int n_embd, int n_ff, long long cap) {
     __shared__ float sm[kHad];
     __shared__ float smax[4];
     pdl_launch_dependents();
     const int e = blockIdx.y, g = group_of(grp_start, *n_groups, e);
     if (g < 0) return;
     const int nb = n_embd / kHad, m = blockIdx.x / nb, b = blockIdx.x % nb, i = b * kHad + threadIdx.x;
-    const __half* suh = (const __half*) (grp_ptr[g] + vec_off) + (m ? n_embd + n_ff : 0);
+    const __half* suh = (const __half*) (grp_ptr[g] + vecs.offset(g)) + (m ? n_embd + n_ff : 0);
     const float v = fwht128(x[(size_t) ent_tok[e] * n_embd + i] * __half2float(suh[i]), sm);
     split128(v, smax, xa, (size_t) m * cap + e, n_embd, b);
 }
@@ -230,7 +241,7 @@ __global__ void __launch_bounds__(kHad) exl3_in_kernel(const unsigned long long*
 __global__ void __launch_bounds__(kHad) exl3_mid_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                         const int32_t* __restrict__ grp_start,
                                                         const int32_t* __restrict__ n_groups, const float* __restrict__ gu,
-                                                        ActRef ha, size_t vec_off, int n_embd, int n_ff, long long cap,
+                                                        ActRef ha, BlobVectors vecs, int n_embd, int n_ff, long long cap,
                                                         float beta, float up_beta) {
     __shared__ float sm[kHad];
     __shared__ float smax[4];
@@ -239,7 +250,7 @@ __global__ void __launch_bounds__(kHad) exl3_mid_kernel(const unsigned long long
     const int e = blockIdx.y, g = group_of(grp_start, *n_groups, e);
     if (g < 0) return;
     const int i = blockIdx.x * kHad + threadIdx.x;
-    const __half* vec = (const __half*) (grp_ptr[g] + vec_off);
+    const __half* vec = (const __half*) (grp_ptr[g] + vecs.offset(g));
     const float gv = fwht128(gu[(size_t) e * n_ff + i], sm) * __half2float(vec[n_embd + i]);
     const float uv = fwht128(gu[((size_t) cap + e) * n_ff + i], sm) * __half2float(vec[2 * n_embd + n_ff + i]);
     float h;
@@ -258,13 +269,13 @@ __global__ void __launch_bounds__(kHad) exl3_out_kernel(const unsigned long long
                                                         const int32_t* __restrict__ grp_start,
                                                         const int32_t* __restrict__ n_groups,
                                                         const int32_t* __restrict__ ent_dst, const float* __restrict__ dn,
-                                                        float* __restrict__ out, size_t vec_off, int n_embd, int n_ff) {
+                                                        float* __restrict__ out, BlobVectors vecs, int n_embd, int n_ff) {
     __shared__ float sm[kHad];
     pdl_wait();
     const int e = blockIdx.y, g = group_of(grp_start, *n_groups, e);
     if (g < 0) return;
     const int i = blockIdx.x * kHad + threadIdx.x;
-    const __half* svh = (const __half*) (grp_ptr[g] + vec_off) + 2 * (n_embd + n_ff) + n_ff;
+    const __half* svh = (const __half*) (grp_ptr[g] + vecs.offset(g)) + 2 * (n_embd + n_ff) + n_ff;
     out[(size_t) ent_dst[e] * n_embd + i] = fwht128(dn[(size_t) e * n_embd + i], sm) * __half2float(svh[i]);
 }
 
@@ -278,6 +289,7 @@ struct RowsArgs {
     size_t mat_stride;   // bytes from one matrix to the next
     long long cap;
     int n_mat, n_in, n_out;
+    const Exl3Rates* rates;
 };
 
 // d += A B on the tensor cores: A 16 x 16 fp16 (four registers of the A fragment), B 16 x 8 fp16, d 16 x 8 fp32.
@@ -386,11 +398,35 @@ __device__ __forceinline__ void band_entries(const uint32_t* __restrict__ tiles,
     __syncthreads();
 }
 
+#define EXL3_RATES(X) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(10) X(12) X(14) X(16)
+
+// K2 = 0: one launch for all rates, with a group-uniform branch around the same band computation.
+template<int K2>
+__device__ const uint32_t* band_tiles(const RowsArgs& a, int g, int m, int band, int& rate) {
+    size_t off;
+    if constexpr (K2 == 0) {
+        const Exl3Rates r = a.rates[g];
+        const size_t gu_bytes = (size_t) a.n_in * a.n_out / 16 * r.gu;
+        off = (a.n_mat == 2 ? m : 2) * gu_bytes;
+        rate = a.n_mat == 2 ? r.gu : r.down;
+    } else {
+        off = a.mat_off + m * a.mat_stride;
+        rate = K2;
+    }
+    return (const uint32_t*) (a.grp_ptr[g] + off) + (size_t) band * (a.n_in / 16) * (4 * rate);
+}
+
+template<int K2, int NWARP>
+__device__ void group_band(const uint32_t* tiles, const ActRef& x, int e0, int e1, int n_in, float* out, int n_out,
+                           int band, float (*part)[8][16]) {
+    for (int e = e0; e < e1; e += 8)
+        band_entries<K2, NWARP>(tiles, x, (size_t) e, min(8, e1 - e), n_in, out + (size_t) e * n_out, n_out, band, part);
+}
+
 // Grid (bands of every matrix, groups side by side), 32 NWARP threads: a block per band; a block row strides over
 // the groups past the grid's.
 template<int K2, int NWARP>
 __global__ void __launch_bounds__(32 * NWARP) exl3_rows_kernel(RowsArgs a) {
-    constexpr int W = 4 * K2;
     __shared__ float part[NWARP][8][16];
     const int bands = a.n_out / 16, m = blockIdx.x / bands, band = blockIdx.x % bands, kt_n = a.n_in / 16;
     const ActRef xm{a.x.hi + (size_t) m * a.cap * a.n_in, a.x.lo + (size_t) m * a.cap * a.n_in,
@@ -399,17 +435,22 @@ __global__ void __launch_bounds__(32 * NWARP) exl3_rows_kernel(RowsArgs a) {
     const int ng = *a.n_groups;
     pdl_launch_dependents();
     if ((int) blockIdx.y < ng) {   // the plan and the weights were written before this call: the first band into L2
-        const char* t0 = (const char*) (a.grp_ptr[blockIdx.y] + a.mat_off + m * a.mat_stride) + (size_t) band * kt_n * W * 4;
-        for (int o = 128 * threadIdx.x; o < kt_n * W * 4; o += 128 * blockDim.x)
+        int rate;
+        const char* t0 = (const char*) band_tiles<K2>(a, blockIdx.y, m, band, rate);
+        for (int o = 128 * threadIdx.x; o < kt_n * rate * 16; o += 128 * blockDim.x)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(t0 + o));
     }
     pdl_wait();
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint32_t* tiles = (const uint32_t*) (a.grp_ptr[g] + a.mat_off + m * a.mat_stride) + (size_t) band * kt_n * W;
-        const int e1 = a.grp_start[g + 1];
-        for (int e = a.grp_start[g]; e < e1; e += 8)
-            band_entries<K2, NWARP>(tiles, xm, (size_t) e, min(8, e1 - e), a.n_in, om + (size_t) e * a.n_out, a.n_out,
-                                    band, part);
+        int rate;
+        const uint32_t* tiles = band_tiles<K2>(a, g, m, band, rate);
+        const int e0 = a.grp_start[g], e1 = a.grp_start[g + 1];
+        if constexpr (K2 != 0) group_band<K2, NWARP>(tiles, xm, e0, e1, a.n_in, om, a.n_out, band, part);
+        else switch (rate) {
+#define X(K) case K: group_band<K, NWARP>(tiles, xm, e0, e1, a.n_in, om, a.n_out, band, part); break;
+            EXL3_RATES(X)
+#undef X
+        }
     }
 }
 
@@ -530,14 +571,12 @@ __global__ void __launch_bounds__(kDqT) exl3_dequant_kernel(DqArgs q) {
     }
 }
 
-#define EXL3_RATES(X) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(10) X(12) X(14) X(16)
-
 // a band's warps: five where the input's 128-value blocks split evenly over them, else eight
 template<int NWARP>
 void launch_rows_w(int k2, dim3 grid, cudaStream_t s, const RowsArgs& a) {
     switch (k2) {
 #define X(K2) case K2: launch_pdl(exl3_rows_kernel<K2, NWARP>, grid, dim3(32 * NWARP), 0, s, a); break;
-        EXL3_RATES(X)
+        X(0) EXL3_RATES(X)
 #undef X
         default: basalt::log::error("basalt", "exl3_expert_grouped: bitrate %d/2", k2); std::exit(1);
     }
@@ -603,7 +642,7 @@ void exl3_copy_rows(const float* x, float* y, int64_t n, void* stream) {
 void exl3_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                          const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                          int64_t cap_entries, const float* x, void* scratch, float* out, void* stream,
-                         int64_t grid_groups) {
+                         int64_t grid_groups, const Exl3Rates* rates) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (!exl3_expert_supported(L.gu_type, L.d_type, L.n_embd, L.n_ff)) {
         basalt::log::error("basalt", "exl3_expert_grouped: types %d / %d at %lld x %lld", L.gu_type, L.d_type,
@@ -629,21 +668,21 @@ void exl3_expert_grouped(const NativeExpertLayout& L, const unsigned long long* 
     p += al256(2 * c * (size_t) nf * f);
     const ActRef ha = split(c, nf);
     float* dn = (float*) p;
-    const size_t vec_off = L.bytes - cpu::exl3_vec_bytes(ne, nf);
+    const BlobVectors vecs{rates, (size_t) ne * nf / 16, L.bytes - cpu::exl3_vec_bytes(ne, nf)};
     const unsigned gy = (unsigned) ((grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups);
     const unsigned ce = (unsigned) cap_entries;
 
-    exl3_in_kernel<<<dim3((unsigned) (2 * ne / kHad), ce), kHad, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, x, xa, vec_off,
+    exl3_in_kernel<<<dim3((unsigned) (2 * ne / kHad), ce), kHad, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, x, xa, vecs,
                                                                        ne, nf, (long long) cap_entries);
     PdlScope pdl(true);   // the four after the first start early (the plan and the weights predate the call)
-    RowsArgs a{grp_ptr, grp_start, n_groups, xa, gu, 0, L.up_off, (long long) cap_entries, 2, ne, nf};
-    launch_rows(cpu::exl3_k2(L.gu_type), dim3((unsigned) (2 * nf / 16), gy), s, a);
+    RowsArgs a{grp_ptr, grp_start, n_groups, xa, gu, 0, L.up_off, (long long) cap_entries, 2, ne, nf, rates};
+    launch_rows(rates ? 0 : cpu::exl3_k2(L.gu_type), dim3((unsigned) (2 * nf / 16), gy), s, a);
     launch_pdl(exl3_mid_kernel, dim3((unsigned) (nf / kHad), ce), dim3(kHad), 0, s, grp_ptr, grp_start, n_groups,
-               (const float*) gu, ha, vec_off, ne, nf, (long long) cap_entries, L.situ_beta, L.situ_up);
-    RowsArgs d{grp_ptr, grp_start, n_groups, ha, dn, L.down_off, (size_t) 0, (long long) cap_entries, 1, nf, ne};
-    launch_rows(cpu::exl3_k2(L.d_type), dim3((unsigned) (ne / 16), gy), s, d);
+               (const float*) gu, ha, vecs, ne, nf, (long long) cap_entries, L.situ_beta, L.situ_up);
+    RowsArgs d{grp_ptr, grp_start, n_groups, ha, dn, L.down_off, (size_t) 0, (long long) cap_entries, 1, nf, ne, rates};
+    launch_rows(rates ? 0 : cpu::exl3_k2(L.d_type), dim3((unsigned) (ne / 16), gy), s, d);
     launch_pdl(exl3_out_kernel, dim3((unsigned) (ne / kHad), ce), dim3(kHad), 0, s, grp_ptr, grp_start, n_groups, ent_dst,
-               (const float*) dn, out, vec_off, ne, nf);
+               (const float*) dn, out, vecs, ne, nf);
     check("exl3_expert_grouped");
 }
 

@@ -29,12 +29,16 @@ inline size_t exl3_act_bytes(int64_t n_embd) { return (size_t) n_embd * sizeof(f
 /// y = x for `n` floats: a token's activation kept for the grouped call.
 void exl3_copy_rows(const float* x, float* y, int64_t n, void* stream);
 
+/// Gate/up and down bits per weight, in half-bit units (validated when the pack is opened).
+struct Exl3Rates { uint8_t gu, down; };
+
 /// native_expert_grouped's contract with `x` the tokens' float rows (n_embd each): group g's blob at grp_ptr[g],
 /// its entries [grp_start[g], grp_start[g+1]) read row ent_tok[e] of x and write row ent_dst[e] of `out`.
+/// When groups differ in rate, `rates[g]` on device supplies group g's rates instead of L's.
 void exl3_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                          const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                          int64_t cap_entries, const float* x, void* scratch, float* out, void* stream,
-                         int64_t grid_groups = 0);
+                         int64_t grid_groups = 0, const Exl3Rates* rates = nullptr);
 
 /// One expert blob's gate and up in the original basis as fp16, interleaved as the prompt path reads them: row 2r =
 /// gate row r, row 2r+1 = up row r, n_embd values each.

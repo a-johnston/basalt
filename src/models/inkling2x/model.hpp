@@ -2,7 +2,7 @@
 // layer in one device buffer.
 #pragma once
 
-#include "basalt/kernels/iq_kernels.hpp"
+#include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/model/adapter.hpp"
 #include "models/inkling2x/pack.hpp"
 
@@ -36,13 +36,10 @@ public:
     /// Device tensor `blk.<layer>.<suffix>` or a global name; null when absent.
     const DevTensor* tensor(const std::string& name) const;
     const DevTensor* tensor(int layer, const char* suffix) const { return tensor("blk." + std::to_string(layer) + "." + suffix); }
-    /// Stored layer `l`'s experts: each one's device address and rate pair ([n_expert] each, device), and the layout of each
-    /// pair (one for a layer of one type pair).
+    /// Per-expert blob addresses and, for a mixed-rate layer only, the rates (both on device).
     const unsigned long long* expert_ptrs(int l) const { return d_ptr_ + (size_t) l * pack_.geo.n_expert; }
-    const int32_t* expert_classes(int l) const { return d_cls_ + (size_t) l * pack_.geo.n_expert; }
-    const std::vector<::basalt::kernels::NativeExpertLayout>& expert_layouts(int l) const { return classes_[(size_t) l]; }
-    /// The most rate pairs a layer has.
-    int max_classes() const { return max_classes_; }
+    const ::basalt::kernels::Exl3Rates* expert_rates(int l) const { return mixed_[l] ? d_rates_ + (size_t) l * pack_.geo.n_expert : nullptr; }
+    const ::basalt::kernels::NativeExpertLayout& expert_layout(int l) const { return layouts_[l]; }
     int device() const { return device_; }
     int spec() const { return spec_; }
     const std::string& diag_dump() const { return diag_dump_; }
@@ -52,10 +49,10 @@ private:
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
     uint8_t* experts_ = nullptr;
-    std::vector<std::vector<::basalt::kernels::NativeExpertLayout>> classes_;
+    std::vector<::basalt::kernels::NativeExpertLayout> layouts_;
+    std::vector<bool> mixed_;
     unsigned long long* d_ptr_ = nullptr;
-    int32_t* d_cls_ = nullptr;
-    int max_classes_ = 1;
+    ::basalt::kernels::Exl3Rates* d_rates_ = nullptr;
     int device_ = 0, spec_ = 0, fd_ = -1;
     int64_t ctx_ = kDefaultContext;
     std::string diag_dump_;

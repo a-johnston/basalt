@@ -3,6 +3,7 @@
 #include "models/inkling2x/model.hpp"
 
 #include "basalt/core/loader.hpp"
+#include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/log.hpp"
 #include "basalt/platform/file.hpp"
 
@@ -20,7 +21,7 @@ Inkling2Model::~Inkling2Model() {
         if (t.ptr) cudaFree(t.ptr);
     if (experts_) cudaFree(experts_);
     if (d_ptr_) cudaFree(d_ptr_);
-    if (d_cls_) cudaFree(d_cls_);
+    if (d_rates_) cudaFree(d_rates_);
     if (fd_ >= 0) platform::close_fd(fd_);
 }
 
@@ -44,31 +45,30 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     desc_.n_expert_used = g.n_used;
     desc_.n_ff_exp = g.n_ff_exp;
     desc_.context_length = g.context_length;
-    // each layer's experts by rate pair: a layout per pair (one for a uniform layer), each expert its pair's index
-    classes_.assign((size_t) g.n_layers, {});
-    std::vector<int32_t> cls((size_t) g.n_layers * g.n_expert);
+    namespace bk = ::basalt::kernels;
+    layouts_.resize(g.n_layers);
+    mixed_.assign(g.n_layers, false);
+    std::vector<bk::Exl3Rates> rates((size_t) g.n_layers * g.n_expert);
     for (int l = 0; l < g.n_layers; ++l) {
         const ExpertLayer& el = pack_.experts[(size_t) l];
-        std::vector<std::pair<int, int>> pairs;
         for (int e = 0; e < g.n_expert; ++e) {
             const ExpertBlob& b = el.blobs[(size_t) e];
-            const auto it = std::find(pairs.begin(), pairs.end(), std::make_pair(b.gu_type, b.d_type));
-            int c = (int) (it - pairs.begin());
-            if (it == pairs.end()) {
-                if (!::basalt::kernels::native_expert_supported(b.gu_type, b.d_type, g.n_embd, g.n_ff_exp))
-                    return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + "'s experts (gate/up type " + std::to_string(b.gu_type) +
-                                                      ", down " + std::to_string(b.d_type) + ") have no kernels"};
-                ::basalt::kernels::NativeExpertLayout lay = ::basalt::kernels::native_expert_layout(b.gu_type, b.d_type, g.n_embd, g.n_ff_exp);
+            if (!bk::native_expert_supported(b.gu_type, b.d_type, g.n_embd, g.n_ff_exp))
+                return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + "'s expert types have no kernels"};
+            auto lay = bk::native_expert_layout(b.gu_type, b.d_type, g.n_embd, g.n_ff_exp);
+            if (e == 0) {
                 lay.situ_beta = g.situ_beta;
                 lay.situ_up = g.situ_up;
-                classes_[(size_t) l].push_back(lay);
-                pairs.emplace_back(b.gu_type, b.d_type);
+                layouts_[l] = lay;
+            } else if (b.gu_type != layouts_[l].gu_type || b.d_type != layouts_[l].d_type) {
+                if (!bk::cpu::exl3_supported(b.gu_type) || !bk::cpu::exl3_supported(layouts_[l].gu_type))
+                    return {model::Status::Error, "inkling2x: mixed expert rates require EXL3"};
+                mixed_[l] = true;
             }
-            if (b.bytes != classes_[(size_t) l][(size_t) c].bytes)
+            if (b.bytes != lay.bytes)
                 return {model::Status::Error, "inkling2x: layer " + std::to_string(l) + " expert " + std::to_string(e) + "'s blob size does not match its layout"};
-            cls[(size_t) l * g.n_expert + e] = c;
+            rates[(size_t) l * g.n_expert + e] = {(uint8_t) bk::cpu::exl3_k2(b.gu_type), (uint8_t) bk::cpu::exl3_k2(b.d_type)};
         }
-        max_classes_ = std::max(max_classes_, (int) pairs.size());
         desc_.expert_gate_up_type.push_back(el.blobs[0].gu_type);
         desc_.expert_down_type.push_back(el.blobs[0].d_type);
     }
@@ -118,9 +118,11 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     for (int l = 0; l < g.n_layers; ++l)
         for (int e = 0; e < g.n_expert; ++e)
             ptr[(size_t) l * g.n_expert + e] = (unsigned long long) (uintptr_t) (experts_ + pack_.experts[(size_t) l].blobs[(size_t) e].offset);
-    if (cudaMalloc((void**) &d_ptr_, ptr.size() * sizeof(ptr[0])) != cudaSuccess || cudaMalloc((void**) &d_cls_, cls.size() * 4) != cudaSuccess ||
+    const size_t rate_bytes = rates.size() * sizeof(rates[0]);
+    const bool mixed = std::find(mixed_.begin(), mixed_.end(), true) != mixed_.end();
+    if (cudaMalloc(&d_ptr_, ptr.size() * sizeof(ptr[0])) != cudaSuccess ||
         cudaMemcpy(d_ptr_, ptr.data(), ptr.size() * sizeof(ptr[0]), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(d_cls_, cls.data(), cls.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        (mixed && (cudaMalloc(&d_rates_, rate_bytes) != cudaSuccess || cudaMemcpy(d_rates_, rates.data(), rate_bytes, cudaMemcpyHostToDevice) != cudaSuccess))) {
         cudaGetLastError();
         return {model::Status::Error, "inkling2x: out of device memory for the expert tables"};
     }

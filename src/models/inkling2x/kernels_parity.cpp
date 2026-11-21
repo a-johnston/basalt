@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -67,7 +68,7 @@ void report(const char* what, const std::vector<float>& got, const std::vector<d
         l1r += std::fabs(ref[i]);
     }
     const double rel = mref > 0 ? mabs / mref : mabs;
-    const bool ok = std::isfinite(rel) && rel <= tol;
+    const bool ok = std::isfinite(l1) && std::isfinite(rel) && rel <= tol;
     std::printf("%-34s max abs %.3e  max rel %.3e  L1 rel %.3e  %s\n", what, mabs, rel, l1r > 0 ? l1 / l1r : l1, ok ? "ok" : "FAIL");
     failures += !ok;
 }
@@ -383,7 +384,6 @@ void check_experts() {
     std::vector<unsigned long long> ptrs(NEXP);
     for (int e = 0; e < NEXP; ++e) ptrs[(size_t) e] = (unsigned long long) (uintptr_t) (base + (size_t) e * L.bytes);
     unsigned long long* eptr = up(ptrs);
-    int32_t* ecls = up(std::vector<int32_t>(NEXP, 0));
     float* x = up(xh);
     int32_t* idd = up(ids);
     float* wd = up(wts);
@@ -396,7 +396,7 @@ void check_experts() {
     float* eo = zeros<float>((size_t) R * KTOP * E);
     float* y = zeros<float>((size_t) R * E);
     auto run = [&](int rows, float* yy) {
-        k::group_experts(idd, rows, KTOP, NEXP, eptr, ecls, 1, gp, gs, ng, dst, tok, nullptr);
+        k::group_experts(idd, rows, KTOP, NEXP, eptr, nullptr, gp, nullptr, gs, ng, dst, tok, nullptr);
         bk::native_expert_grouped(L, gp, gs, ng, dst, tok, NEXP, (int64_t) rows * KTOP, xq, scratch, eo, nullptr);
         k::sum_experts(eo, wd, rows, KTOP, E, yy, nullptr);
     };
@@ -468,10 +468,10 @@ std::vector<double> exl3_matvec(int type, const uint8_t* trellis, const __half* 
 }
 
 // a mixed-rate layer as REXL3 quants have them: even experts 2.5 bpw gate/up and 3 bpw down, odd ones 3 and 3.5, their blobs
-// back to back at their own sizes, one grouped call per rate pair
-void check_exl3_experts() {
+// back to back at their own sizes; one mixed call against one uniform call per rate pair
+void check_exl3_experts(bool bench = false) {
     using basalt::kernels::cpu::kExl3TypeBase;
-    const int R = 3, NE = 16;
+    const int R = bench ? 64 : 9, NE = bench ? NEXP : 16;
     const int GU[2] = {kExl3TypeBase + 5, kExl3TypeBase + 6}, DN[2] = {kExl3TypeBase + 6, kExl3TypeBase + 7};
     bk::NativeExpertLayout L[2];
     for (int c = 0; c < 2; ++c) {
@@ -502,28 +502,46 @@ void check_exl3_experts() {
         std::vector<int> pick(NE);
         for (int e = 0; e < NE; ++e) pick[e] = e;
         std::shuffle(pick.begin(), pick.end(), rng);
+        if (!bench) std::iter_swap(pick.begin(), std::find(pick.begin(), pick.end(), 0));   // a full 8-entry band and its tail
         for (int j = 0; j < KTOP; ++j) { ids[(size_t) r * KTOP + j] = pick[j]; wts[(size_t) r * KTOP + j] = 0.5f + 0.25f * j; }
     }
     uint8_t* base = up(blobs);
     std::vector<unsigned long long> ptrs(NE);
     for (int e = 0; e < NE; ++e) ptrs[(size_t) e] = (unsigned long long) (uintptr_t) (base + off[(size_t) e]);
     unsigned long long* eptr = up(ptrs);
-    int32_t* ecls = up(cls);
+    std::vector<bk::Exl3Rates> rates(NE);
+    for (int e = 0; e < NE; ++e) rates[e] = {(uint8_t) (GU[cls[e]] - kExl3TypeBase), (uint8_t) (DN[cls[e]] - kExl3TypeBase)};
+    auto* er = up(rates);
+    auto* gr = zeros<bk::Exl3Rates>(NE);
     float* x = up(xh);
     int32_t* idd = up(ids);
     float* wd = up(wts);
-    auto* gp = zeros<unsigned long long>(2 * NE);
-    int32_t *gs = zeros<int32_t>(2 * (NE + 1)), *ng = zeros<int32_t>(2), *dst = zeros<int32_t>((size_t) R * KTOP), *tok = zeros<int32_t>((size_t) R * KTOP);
+    auto* gp = zeros<unsigned long long>(NE);
+    int32_t *gs = zeros<int32_t>(NE + 1), *ng = zeros<int32_t>(1), *dst = zeros<int32_t>((size_t) R * KTOP), *tok = zeros<int32_t>((size_t) R * KTOP);
     void* scratch = zeros<uint8_t>(std::max(bk::native_expert_scratch_bytes(L[0], (int64_t) R * KTOP), bk::native_expert_scratch_bytes(L[1], (int64_t) R * KTOP)));
     float* eo = zeros<float>((size_t) R * KTOP * E);
     float* y = zeros<float>((size_t) R * E);
-    auto run = [&](int rows, float* yy) {
-        k::group_experts(idd, rows, KTOP, NE, eptr, ecls, 2, gp, gs, ng, dst, tok, nullptr);
-        for (int c = 0; c < 2; ++c)   // EXL3 reads the rows as floats
-            bk::native_expert_grouped(L[c], gp + c * NE, gs + c * (NE + 1), ng + c, dst, tok, NE, (int64_t) rows * KTOP, x, scratch, eo, nullptr);
-        k::sum_experts(eo, wd, rows, KTOP, E, yy, nullptr);
+    auto run = [&](int row, int rows, float* yy) {
+        k::group_experts(idd + row * KTOP, rows, KTOP, NE, eptr, er, gp, gr, gs, ng, dst, tok, nullptr);
+        bk::exl3_expert_grouped(L[0], gp, gs, ng, dst, tok, std::min(NE, rows * KTOP), rows * KTOP, x + row * E,
+                                scratch, eo, nullptr, 0, gr);
+        k::sum_experts(eo, wd + row * KTOP, rows, KTOP, E, yy, nullptr);
     };
-    run(R, y);
+    if (bench) {   // a decode step, cycling through distinct picks so the blobs do not all fit in cache
+        size_t bytes = 0;
+        for (auto e : ids) bytes += L[cls[e]].bytes;
+        for (int r = 0; r < R; ++r) run(r, 1, y);
+        cudaDeviceSynchronize();
+        constexpr int reps = 8;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i)
+            for (int r = 0; r < R; ++r) run(r, 1, y);
+        if (cudaDeviceSynchronize() != cudaSuccess) { ++failures; return; }
+        double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (R * reps);
+        std::printf("EXL3 group + 8 experts + sum: %.1f us per call, %.0f GB/s of expert weights\n", us, (double) bytes / (R * us * 1e3));
+        return;
+    }
+    run(0, R, y);
     std::vector<double> ref((size_t) R * E, 0.0);
     for (int r = 0; r < R; ++r) {
         const std::vector<double> xr(xh.begin() + (size_t) r * E, xh.begin() + (size_t) (r + 1) * E);
@@ -542,8 +560,20 @@ void check_exl3_experts() {
     const auto got = down(y, ref.size());
     report("EXL3 experts, two rate pairs, situ", got, ref, 1e-3);
     float* y1 = zeros<float>(E);
-    run(1, y1);
-    same("EXL3 experts", down(y1, E).data(), got.data(), E);
+    for (int r = 0; r < R; ++r) {
+        run(r, 1, y1);
+        same("EXL3 experts", down(y1, E).data(), got.data() + (size_t) r * E, E);
+    }
+    for (int c = 0; c < 2; ++c) {
+        auto picks = ids;
+        for (auto& id : picks) if (cls[id] != c) id = -1;
+        k::group_experts(up(picks), R, KTOP, NE, eptr, nullptr, gp, nullptr, gs, ng, dst, tok, nullptr);
+        bk::native_expert_grouped(L[c], gp, gs, ng, dst, tok, NE, R * KTOP, x, scratch, eo, nullptr);
+    }
+    k::sum_experts(eo, wd, R, KTOP, E, y, nullptr);
+    const bool identical = std::memcmp(down(y, got.size()).data(), got.data(), got.size() * sizeof(float)) == 0;
+    std::printf("EXL3 mixed vs uniform groups: %s\n", identical ? "identical" : "FAIL");
+    failures += !identical;
 }
 
 void check_logits() {
@@ -559,7 +589,11 @@ void check_logits() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
+        check_exl3_experts(true);
+        return failures ? 1 : 0;
+    }
     check_mix();
     check_control();
     check_conv();
