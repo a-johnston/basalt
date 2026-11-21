@@ -1,7 +1,9 @@
 // src/models/inkling2x/session.cpp - an Inkling 2 session: the K/V caches and convolution rings of its layer slots, and the
 // forward of a run of rows (a decode window or a prompt chunk): the stored layers before the loop, the loop's core once
 // per pass (each pass after the first mixing in the one before through the controllers), the layers after it, and the
-// output. Every expert of every layer is on the card, so a row's whole forward stays there.
+// output. Every expert of every layer is on the card, so a row's whole forward stays there. A one-row decode replays the
+// forward as a CUDA graph, recorded again when the attention's split count changes (every 256 positions).
+#include "basalt/core/graph.hpp"
 #include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -17,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -67,7 +70,7 @@ public:
                   f(hn_, (size_t) R * E) && b(hq_, (size_t) kMaxWindow * q8) && f(hl_, (size_t) kMaxWindow * g_.vocab_padded) &&
                   f(logits_, (size_t) kMaxWindow * g_.n_vocab) && alloc((void**) &pick_, (size_t) (3 * kMaxWindow) * 4, err) &&
                   f(lp_, bk::row_logprobs_scratch_floats(kMaxWindow, g_.n_vocab) + (size_t) kMaxWindow * bk::kLogprobStride) &&
-                  f(d_bias_, (size_t) g_.n_vocab) && f(d_mask_, (size_t) g_.n_vocab);
+                  f(d_bias_, (size_t) g_.n_vocab) && f(d_mask_, (size_t) g_.n_vocab) && alloc((void**) &d_pos_, sizeof(int64_t), err);
         if (!ok) return false;
         size_t escr = 0;
         for (int l = 0; l < g_.n_layers; ++l)
@@ -285,10 +288,10 @@ private:
         const float kv_scale = 1.0f / std::sqrt((float) ((swa ? 1 : 2) * g_.n_conv + 1));
         const float post_scale = 1.0f / std::sqrt((float) (g_.n_conv + 1));
         const int keep = std::min(R, kRing - 3);
-        ik::short_conv(kraw_, F(l, "attn_k_conv.weight"), swa ? nullptr : dk_, kHead, ring, 0, pos0, R, nkv, kv_scale, k_, stream_);
-        ik::short_conv(vraw_, F(l, "attn_v_conv.weight"), swa ? nullptr : dv_, kHead, ring, nkv, pos0, R, nkv, kv_scale, v_, stream_);
-        ik::conv_store(kraw_, ring, 0, pos0, R, keep, nkv, stream_);
-        ik::conv_store(vraw_, ring, nkv, pos0, R, keep, nkv, stream_);
+        ik::short_conv(kraw_, F(l, "attn_k_conv.weight"), swa ? nullptr : dk_, kHead, ring, 0, d_pos_, R, nkv, kv_scale, k_, stream_);
+        ik::short_conv(vraw_, F(l, "attn_v_conv.weight"), swa ? nullptr : dv_, kHead, ring, nkv, d_pos_, R, nkv, kv_scale, v_, stream_);
+        ik::conv_store(kraw_, ring, 0, d_pos_, R, keep, nkv, stream_);
+        ik::conv_store(vraw_, ring, nkv, d_pos_, R, keep, nkv, stream_);
         ik::PrepArgs pa;
         pa.n_head = g_.n_head;
         pa.n_kv = g_.n_kv;
@@ -299,7 +302,7 @@ private:
         pa.log_scale = !swa;
         pa.log_alpha = g_.log_alpha;
         pa.log_floor = g_.log_floor;
-        ik::qkvr_prep(q_, k_, v_, r_, F(l, "attn_q_clip.weight"), F(l, "attn_rel_clip.weight"), pa, pos0, R, kc_[(size_t) s], vc_[(size_t) s],
+        ik::qkvr_prep(q_, k_, v_, r_, F(l, "attn_q_clip.weight"), F(l, "attn_rel_clip.weight"), pa, d_pos_, R, kc_[(size_t) s], vc_[(size_t) s],
                       cells_[(size_t) s], stream_);
         if (diag()) {
             dump("norm-" + std::to_string(s), nrm_, (int64_t) RE);
@@ -310,19 +313,14 @@ private:
             dump("sinks-" + std::to_string(s), sink_, (int64_t) R * g_.n_head);
             dump("gate-" + std::to_string(s), gate_, (int64_t) R * nq);
         }
-        ik::AttnArgs aa;
-        aa.n_head = g_.n_head;
-        aa.n_kv = g_.n_kv;
-        aa.d_rel = g_.d_rel;
-        aa.extent = swa ? g_.window : g_.rel_extent;
-        aa.window = swa ? g_.window : 0;
-        aa.cells = cells_[(size_t) s];
-        ik::attention(q_, r_, sink_, gate_, F(l, "attn_rel_bias.weight"), kc_[(size_t) s], vc_[(size_t) s], aa, pos0, R, ws_, att_, stream_);
+        const ik::AttnArgs aa = attn_args(s, l);
+        ik::attention(q_, r_, sink_, gate_, F(l, "attn_rel_bias.weight"), kc_[(size_t) s], vc_[(size_t) s], aa, d_pos_, pos0, R, ws_, att_,
+                      stream_);
         if (diag()) dump("att-" + std::to_string(s), att_, (int64_t) R * nq);
         quant(att_, R, nq, attq_);
         gemv(T(l, "attn_output.weight"), attq_, o_, nq, E, R);
-        ik::short_conv(o_, F(l, "attn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv, pos0, R, E, post_scale, oc_, stream_);
-        ik::conv_store(o_, ring, 2 * nkv, pos0, R, keep, E, stream_);
+        ik::short_conv(o_, F(l, "attn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv, d_pos_, R, E, post_scale, oc_, stream_);
+        ik::conv_store(o_, ring, 2 * nkv, d_pos_, R, keep, E, stream_);
         if (diag()) dump("attn_out-" + std::to_string(s), oc_, (int64_t) RE);
         // a block's first layer starts a new residual stream; the one before joins the mixed states
         if (l % g_.block == 0) {
@@ -362,17 +360,61 @@ private:
             bk::native_expert_grouped(lay, grp_ptr_, grp_start_, n_groups_, ent_dst_, ent_tok_, groups, entries, fxq_, escr_, eout_, stream_);
         }
         ik::sum_experts(eout_, rw_, R, g_.n_used, E, moe_, stream_);
-        ik::short_conv(moe_, F(l, "ffn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv + E, pos0, R, E, post_scale, mc_, stream_);
-        ik::conv_store(moe_, ring, 2 * nkv + E, pos0, R, keep, E, stream_);
+        ik::short_conv(moe_, F(l, "ffn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv + E, d_pos_, R, E, post_scale, mc_, stream_);
+        ik::conv_store(moe_, ring, 2 * nkv + E, d_pos_, R, keep, E, stream_);
         bk::add_inplace(cur_, mc_, (int64_t) RE, stream_);
         if (diag()) dump("l_out-" + std::to_string(s), cur_, (int64_t) RE);
     }
 
-    // the forward of R rows at pos0; the last `head` rows get logits
+    ik::AttnArgs attn_args(int s, int l) const {
+        const bool swa = g_.swa[(size_t) l];
+        ik::AttnArgs aa;
+        aa.n_head = g_.n_head;
+        aa.n_kv = g_.n_kv;
+        aa.d_rel = g_.d_rel;
+        aa.extent = swa ? g_.window : g_.rel_extent;
+        aa.window = swa ? g_.window : 0;
+        aa.cells = cells_[(size_t) s];
+        return aa;
+    }
+
+    // The attention's split counts at a last position, full layers then sliding ones: a graph replays where they match.
+    std::pair<int, int> splits_at(int64_t p_last) const {
+        int full = 0, sliding = 0;
+        for (int l = 0; l < g_.n_layers; ++l) (g_.swa[(size_t) l] ? sliding : full) = ik::attention_splits(attn_args(l, l), p_last);
+        return {full, sliding};
+    }
+
+    // The R rows at pos0 (the last `head` get logits): the tokens and the position go to the card, then the forward, as
+    // the graph for a one-row decode
     bool run_rows(const int32_t* tokens, int R, int64_t pos0, int head, std::string& err) {
+        cudaMemcpyAsync(tok_, tokens, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
+        ik::set_position(d_pos_, pos0, stream_);
+        if (R != 1 || head != 1 || diag()) {
+            if (!forward(R, pos0, head, err)) return false;
+        } else {
+            const std::pair<int, int> key = splits_at(pos0);
+            if (!graph_.valid() || key != graph_key_) {
+                graph_ = core::CapturedGraph();
+                if (!graph_.begin(stream_, err)) return false;
+                const bool ok = forward(1, pos0, 1, err);
+                if (!graph_.end(stream_, err) || !ok) {
+                    graph_ = core::CapturedGraph();
+                    err = "the decode graph: " + err;
+                    return false;
+                }
+                graph_key_ = key;
+            }
+            if (!graph_.launch(stream_, err)) return false;
+        }
+        pos_ = pos0 + R;
+        return true;
+    }
+
+    // the forward of R rows at pos0 (in d_pos_); the last `head` rows get logits
+    bool forward(int R, int64_t pos0, int head, std::string& err) {
         const int E = g_.n_embd;
         const size_t RE = (size_t) R * E;
-        cudaMemcpyAsync(tok_, tokens, (size_t) R * 4, cudaMemcpyHostToDevice, stream_);
         const DevTensor* te = m_.tensor("token_embd.weight");
         bk::iq_embed_rows(te->type, te->ptr, bk::iq_row_bytes(te->type, E), tok_, R, E, cur_, stream_);
         bk::rms_norm_rows(cur_, (const float*) m_.tensor("token_embd_norm.weight")->ptr, emb_, R, E, g_.rms_eps, stream_);
@@ -409,7 +451,6 @@ private:
             err = "a kernel failed to launch";
             return false;
         }
-        pos_ = pos0 + R;
         return true;
     }
 
@@ -441,6 +482,9 @@ private:
     bk::SamplerParams sampling_;
     float *lp_ = nullptr, *d_bias_ = nullptr, *d_mask_ = nullptr;
     int32_t* tok_ = nullptr;
+    int64_t* d_pos_ = nullptr;   // the first row's position, which the kernels read
+    core::CapturedGraph graph_;  // the one-row decode
+    std::pair<int, int> graph_key_{-1, -1};
     float *emb_ = nullptr, *cur_ = nullptr, *pre_ = nullptr, *out_[2] = {nullptr, nullptr}, *mix_ = nullptr, *msg_ = nullptr, *ctl_ = nullptr,
           *nrm_ = nullptr;
     void *xq_ = nullptr, *attq_ = nullptr, *fxq_ = nullptr, *hq_ = nullptr, *escr_ = nullptr, *ws_ = nullptr;

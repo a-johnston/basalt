@@ -37,6 +37,14 @@ std::vector<float> randn(size_t n, float s = 1.0f) {
     return v;
 }
 
+// a device word holding a position, for the kernels that read theirs from one
+const int64_t* dpos(int64_t p) {
+    int64_t* d = nullptr;
+    cudaMalloc(&d, sizeof(int64_t));
+    cudaMemcpy(d, &p, sizeof(int64_t), cudaMemcpyHostToDevice);
+    return d;
+}
+
 template <class T> T* up(const std::vector<T>& v) {
     T* p = nullptr;
     cudaMalloc(&p, v.size() * sizeof(T));
@@ -177,7 +185,7 @@ void check_conv() {
     k::ConvRing ring{ringd, SLOTS, WIDTH};
     for (int dyn = 0; dyn < 2; ++dyn) {
         const float scale = 1.0f / std::sqrt((float) ((dyn ? 2 : 1) * 4 + 1));
-        k::short_conv(x, w, dyn ? dy : nullptr, HW, ring, CH0, pos0, R, C, scale, out, nullptr);
+        k::short_conv(x, w, dyn ? dy : nullptr, HW, ring, CH0, dpos(pos0), R, C, scale, out, nullptr);
         std::vector<double> ref((size_t) R * C);
         for (int r = 0; r < R; ++r)
             for (int c = 0; c < C; ++c) {
@@ -196,12 +204,12 @@ void check_conv() {
     }
     // position 1: the taps before position 0 are zero
     float* o1 = zeros<float>(C);
-    k::short_conv(x, w, nullptr, HW, ring, CH0, 1, 1, C, 1.0f, o1, nullptr);
+    k::short_conv(x, w, nullptr, HW, ring, CH0, dpos(1), 1, C, 1.0f, o1, nullptr);
     std::vector<double> r1(C);
     for (int c = 0; c < C; ++c)
         r1[c] = xh[c] + xh[c] * wh[(size_t) c * 4 + 3] + ringh[(size_t) 0 * WIDTH + CH0 + c] * wh[(size_t) c * 4 + 2];
     report("short conv at position 1", down(o1, C), r1, 1e-6);
-    k::conv_store(x, ring, CH0, pos0, R, 3, C, nullptr);
+    k::conv_store(x, ring, CH0, dpos(pos0), R, 3, C, nullptr);
     const auto rg = down(ringd, ringh.size());
     bool ok = true;
     for (int r = 0; r < R; ++r)
@@ -247,7 +255,7 @@ void check_attention(bool full) {
     pa.log_floor = 8192.0f;
     // a prompt past the log-scale floor: positions where tau > 1
     const int64_t ppos = full ? 9000 : pos0;
-    k::qkvr_prep(q, kd, vd, r, qs, rs, pa, ppos, R, (uint16_t*) kcd, (uint16_t*) vcd, cells, nullptr);
+    k::qkvr_prep(q, kd, vd, r, qs, rs, pa, dpos(ppos), R, (uint16_t*) kcd, (uint16_t*) vcd, cells, nullptr);
     // the reference preparation
     std::vector<double> qr((size_t) R * H * D), rr((size_t) R * H * DREL);
     for (int row = 0; row < R; ++row) {
@@ -300,7 +308,7 @@ void check_attention(bool full) {
     void* ws = nullptr;
     cudaMalloc(&ws, k::attention_workspace_bytes(R, H, maxk));
     float* out = zeros<float>((size_t) R * H * D);
-    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, apos, R, ws, out, nullptr);
+    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, R, ws, out, nullptr);
     const auto qg = down(q, qr.size()), rg = down(r, rr.size());
     const auto kb = down(kcd, kc.size()), vb = down(vcd, vc.size());
     std::vector<double> ref((size_t) R * H * D);
@@ -340,7 +348,7 @@ void check_attention(bool full) {
     const auto got = down(out, ref.size());
     report(full ? "attention, full layer (> extent)" : "attention, sliding (wrapped ring)", got, ref, 1e-4);
     float* one = zeros<float>((size_t) H * D);
-    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, apos, 1, ws, one, nullptr);
+    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, 1, ws, one, nullptr);
     same(full ? "attention, full layer" : "attention, sliding", down(one, (size_t) H * D).data(), got.data(), (size_t) H * D);
 }
 

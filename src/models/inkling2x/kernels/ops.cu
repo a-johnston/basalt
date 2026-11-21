@@ -152,10 +152,14 @@ __global__ void __launch_bounds__(kCtlThreads) control_out_kernel(const float* _
 }
 
 // ----------------------------------------------------------------------------------------------- short convolutions
+__global__ void set_position_kernel(int64_t* pos, long long value) { *pos = value; }
+
 __global__ void short_conv_kernel(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ dyn, int hw,
-                                  int n_dyn, ConvRing ring, int ch0, long long pos0, int C, float scale, float* __restrict__ out) {
+                                  int n_dyn, ConvRing ring, int ch0, const int64_t* __restrict__ pos, int C, float scale,
+                                  float* __restrict__ out) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (c >= C) return;
+    const long long pos0 = *pos;
     float xv[4];   // x_(t-3) .. x_t
     for (int k = 0; k < 4; ++k) {
         const int rr = r - k;
@@ -173,20 +177,21 @@ __global__ void short_conv_kernel(const float* __restrict__ x, const float* __re
     out[(size_t) r * C + c] = (xv[3] + acc) * scale;
 }
 
-__global__ void conv_store_kernel(const float* __restrict__ x, ConvRing ring, int ch0, long long pos0, int r0, int C) {
+__global__ void conv_store_kernel(const float* __restrict__ x, ConvRing ring, int ch0, const int64_t* __restrict__ pos, int r0, int C) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, r = r0 + blockIdx.y;
     if (c >= C) return;
+    const long long pos0 = *pos;
     ring.data[(size_t) ((pos0 + r) % ring.slots) * ring.width + ch0 + c] = x[(size_t) r * C + c];
 }
 
 // ------------------------------------------------------------------------------------------ the attention's inputs
 // blockIdx.y: n_head Q heads, n_kv K heads, n_kv V heads, then n_head R heads; 128 threads.
 __global__ void qkvr_prep_kernel(float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ rr,
-                                 const float* __restrict__ q_scale, const float* __restrict__ r_scale, PrepArgs a, long long pos0,
-                                 __half* __restrict__ kc, __half* __restrict__ vc, long long cells) {
+                                 const float* __restrict__ q_scale, const float* __restrict__ r_scale, PrepArgs a,
+                                 const int64_t* __restrict__ pos, __half* __restrict__ kc, __half* __restrict__ vc, long long cells) {
     const int row = blockIdx.x, seg = blockIdx.y, d = threadIdx.x;
     __shared__ float red[32];
-    const long long p = pos0 + row;
+    const long long p = *pos + row;
     const float tau = a.log_scale ? 1.0f + a.log_alpha * logf(fmaxf((float) (p + 1) * (1.0f / a.log_floor), 1.0f)) : 1.0f;
     const size_t cell = (size_t) (p % cells);
     if (seg < a.n_head) {   // Q
@@ -285,6 +290,10 @@ __global__ void cap_logits_kernel(const float* __restrict__ x, int ld, int n_voc
 
 }  // namespace
 
+void set_position(int64_t* pos, int64_t value, void* stream) {
+    set_position_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(pos, (long long) value);
+}
+
 void depth_mix(const States& s, const float* queries, int nq, int rows, int n_embd, float eps, float* out, void* stream) {
     if (rows <= 0) return;
     // about 128 blocks for a short run of rows, a block per row and query for a long one
@@ -304,25 +313,25 @@ void loop_control(const float* cur, const float* msg, const float* down, const f
         cur, msg, gain, forget, g, n_embd, rank, out);
 }
 
-void short_conv(const float* x, const float* w, const float* dyn, int head_width, const ConvRing& ring, int ch0, int64_t pos0, int rows,
-                int C, float scale, float* out, void* stream) {
+void short_conv(const float* x, const float* w, const float* dyn, int head_width, const ConvRing& ring, int ch0, const int64_t* pos,
+                int rows, int C, float scale, float* out, void* stream) {
     if (rows <= 0) return;
     const int n_dyn = dyn ? C / head_width * 4 : 0;
     short_conv_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
-        x, w, dyn, head_width, n_dyn, ring, ch0, pos0, C, scale, out);
+        x, w, dyn, head_width, n_dyn, ring, ch0, pos, C, scale, out);
 }
 
-void conv_store(const float* x, const ConvRing& ring, int ch0, int64_t pos0, int rows, int keep, int C, void* stream) {
+void conv_store(const float* x, const ConvRing& ring, int ch0, const int64_t* pos, int rows, int keep, int C, void* stream) {
     const int n = keep < rows ? keep : rows;
     if (n <= 0) return;
-    conv_store_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) n), 256, 0, (cudaStream_t) stream>>>(x, ring, ch0, pos0, rows - n, C);
+    conv_store_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) n), 256, 0, (cudaStream_t) stream>>>(x, ring, ch0, pos, rows - n, C);
 }
 
 void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* q_scale, const float* r_scale, const PrepArgs& a,
-               int64_t pos0, int rows, uint16_t* k_cache, uint16_t* v_cache, int64_t cells, void* stream) {
+               const int64_t* pos, int rows, uint16_t* k_cache, uint16_t* v_cache, int64_t cells, void* stream) {
     if (rows <= 0) return;
     qkvr_prep_kernel<<<dim3((unsigned) rows, (unsigned) (2 * a.n_head + 2 * a.n_kv)), 128, 0, (cudaStream_t) stream>>>(
-        q, k, v, r, q_scale, r_scale, a, pos0, (__half*) k_cache, (__half*) v_cache, cells);
+        q, k, v, r, q_scale, r_scale, a, pos, (__half*) k_cache, (__half*) v_cache, cells);
 }
 
 void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* expert_ptr, const Exl3Rates* expert_rates,

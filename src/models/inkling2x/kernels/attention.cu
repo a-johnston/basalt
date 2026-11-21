@@ -26,13 +26,13 @@ __device__ __forceinline__ int64_t key_lo(int64_t p, int window) { return window
 __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __restrict__ q, const float* __restrict__ r,
                                                                  const float* __restrict__ sinks, const float* __restrict__ rel_bias,
                                                                  const __half* __restrict__ kc, const __half* __restrict__ vc,
-                                                                 AttnArgs a, long long pos0, int rows, int nsplit,
+                                                                 AttnArgs a, const int64_t* __restrict__ pos, int rows, int nsplit,
                                                                  float* __restrict__ ws) {
     const int row = blockIdx.x, h = blockIdx.y, split = blockIdx.z;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     __shared__ float tab[kSplit];   // the bias minus the sink by distance, over this split's distances (capped at extent)
     __shared__ float wm[kWarps], wl[kWarps], wacc[kWarps][kHead];
-    const long long p = pos0 + row;
+    const long long p = *pos + row;
     const long long lo = key_lo(p, a.window) + (long long) split * kSplit;
     const long long hi = lo + kSplit - 1 < p ? lo + kSplit - 1 : p;
     const size_t slot = ((size_t) row * a.n_head + h) * nsplit + split;
@@ -115,20 +115,23 @@ __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __re
 
 int splits_of(int64_t keys) { return (int) ((keys + kSplit - 1) / kSplit); }
 
+int64_t keys_of(const AttnArgs& a, int64_t p_last) { return a.window > 0 && p_last + 1 > a.window ? a.window : p_last + 1; }
+
 }  // namespace
+
+int attention_splits(const AttnArgs& a, int64_t p_last) { return splits_of(keys_of(a, p_last)); }
 
 size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys) {
     return (size_t) rows * n_head * splits_of(max_keys) * (2 + kHead) * sizeof(float);
 }
 
 void attention(const float* q, const float* r, const float* sinks, const float* gate, const float* rel_bias, const uint16_t* k_cache,
-               const uint16_t* v_cache, const AttnArgs& a, int64_t pos0, int rows, void* ws, float* out, void* stream) {
+               const uint16_t* v_cache, const AttnArgs& a, const int64_t* pos, int64_t pos0, int rows, void* ws, float* out,
+               void* stream) {
     if (rows <= 0) return;
-    const int64_t p_last = pos0 + rows - 1;
-    const int64_t keys = a.window > 0 && p_last + 1 > a.window ? a.window : p_last + 1;
-    const int nsplit = splits_of(keys);
+    const int nsplit = attention_splits(a, pos0 + rows - 1);
     cudaStream_t st = (cudaStream_t) stream;
-    attn_split_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head, (unsigned) nsplit), kWarps * 32, 0, st>>>(q, r, sinks, rel_bias, (const __half*) k_cache, (const __half*) v_cache, a, pos0, rows, nsplit,
+    attn_split_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head, (unsigned) nsplit), kWarps * 32, 0, st>>>(q, r, sinks, rel_bias, (const __half*) k_cache, (const __half*) v_cache, a, pos, rows, nsplit,
                               (float*) ws);
     attn_join_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head), kHead, 0, st>>>((const float*) ws, gate, a.n_head, rows, nsplit, out);
 }
