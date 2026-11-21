@@ -20,6 +20,9 @@ download or any re-quantizing.
   and IQ2_XXS up on one layer) gives the up type as a sixth column under an `# experts v7` header. The converter writes v7
   only for such a model; every other pack keeps v5 (GGUF) or v6 (NVFP4). An engine from before v7 refuses a v7 pack and asks
   for an update.
+- **`experts.layout` v8, no version change:** one row per expert, `layer expert gu_type d_type offset blob_bytes` under an
+  `# experts v8` header, for a mixed-rate quant whose experts of one layer differ in bitrate (Inkling 2 from a SAGE REXL3
+  checkpoint). The Inkling 2 EXL3 converter writes v8; the GGUF path is unchanged. Reading v8 requires engine support.
 - **Tensor type 45, `NVFP4_PLANES`, no version change:** NVFP4 as a code plane and 128 x 4-tiled UE4M3 scales (the TMA
   layout; [model file](model-file.md#nvfp4_planes-tensor-type-45)), the FP32 scale a separate `<name>.scale`. The Qwen3.8-27B
   pack's MLP and head use it; the engine refuses that pack's older ggml-block form.

@@ -266,3 +266,42 @@ python3 tools/convert/convert.py --checkpoint Inkling-2-Mini --out Inkling-2-Min
   ranges, the loop's passes, the experts) and its license; the pretokenizer is the checkpoint's o200k split.
 - 18.38 GiB: experts 14.71, `gguf` 3.03 (drafter included), vision 0.60. Every rounding is deterministic and runs once, in pieces by
   worker processes. How each tensor rounds and what it costs in quality: [precision](precision/inkling2.md).
+
+## Inkling 2 Mini GGUF pack (`inkling2x`)
+
+A second Inkling 2 backend, `inkling2x` (`src/models/inkling2x`), runs packs of community quants: from a
+llama.cpp GGUF of `inkling2_loop` (Inkling 2 Mini; llama.cpp's converter from
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)). Nothing is requantized: every tensor
+keeps its GGUF bytes and name.
+
+```sh
+python3 tools/convert/convert.py --gguf Inkling-2-Mini-IQ3_XXS.gguf --out Inkling-2-Mini-IQ3_XXS-test.basalt
+python3 tools/convert/convert.py --verify Inkling-2-Mini-IQ3_XXS-test.basalt --gguf Inkling-2-Mini-IQ3_XXS.gguf
+```
+
+- `dense`, `dense.index`, `gguf`: as the DeepSeek pack. The 24 stored layers only: the loop runs the core again from the same
+  tensors.
+- `experts`, `experts.layout` (v5): one row per layer from llama.cpp's fused `ffn_gate_up_exps` (the gate's rows first, so an
+  expert's slice is already `[gate | up]`) and `ffn_down_exps`.
+- `meta`: `arch` `inkling2x`, `geometry` (the GGUF's `inkling2_loop.*` keys, the loop's among them), `license` (Apache-2.0 with its
+  text, which the release requires in every copy). `vision` and `mtp` are null.
+
+## Inkling 2 Mini EXL3 pack (`inkling2x`)
+
+From an EXL3 checkpoint of Inkling 2 Mini (the SAGE REXL3 quants), over a GGUF-route pack of the same model for its tokenizer,
+GGUF metadata and tensor table (`tools/convert/exl3_inkling2x.py`):
+
+```sh
+python3 tools/convert/convert.py --sections-from Inkling-2-Mini-IQ3_XXS-test.basalt --exl3 Inkling-2-Mini-SAGE-REXL3-2.92bpw \
+    --out Inkling-2-Mini-SAGE-REXL3-2.92bpw.basalt
+```
+
+- `experts`, `experts.layout` (v8): each expert its own row, `layer expert gu_type d_type offset blob_bytes`, since a mixed-rate
+  quant gives each expert its own gate/up and down bitrates (2 to 4 bpw in the 2.92 bpw quant). A blob is the checkpoint's three
+  trellises, tiles reordered output-major, and its six fp16 vectors, as in the Flash-Next EXL3 pack.
+- `gguf`: every other tensor under the base pack's names and shapes, in llama.cpp's forms: the EXL3 projections and head computed
+  in double and stored once as Q8_0 (the head's padding rows past the vocabulary dropped), the BF16 projections the engine
+  multiplies (sinks, the convolutions' input taps) as Q8_0, the token embedding as BF16, the rest as F32 (the convolutions'
+  taps squeezed, a full layer's static taps reversed, the relative-bias tables transposed, the loop's cross-pass queries
+  stacked per core layer). The checkpoint's BF16 and F32 tensors equal the official checkpoint's bit for bit.
+- `meta.exl3`: the experts' rates (`gate-up/down bpw -> experts`) and how the dense tensors were made.
