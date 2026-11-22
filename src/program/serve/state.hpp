@@ -69,13 +69,7 @@ enum class Flow { proceed, next, quit, error };
 
 struct SlotWin;
 
-// Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
-// a driver that pages GPU memory do so, and a graph spinning on a host flag then never finishes.  A driver that
-// fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
-// a streaming state's residency map).
-inline constexpr int kVramStallMib = 256;
-inline constexpr int kVramFloorMib = 128;
-inline int vram_floor_mib() { return basalt::platform::gpu_memory_pages() ? kVramStallMib : kVramFloorMib; }
+using basalt::platform::vram_floor_mib;
 
 // The server's state every model shares: its input, its requests' conversation chain, its slots.
 class Runtime {

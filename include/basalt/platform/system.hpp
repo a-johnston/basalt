@@ -37,6 +37,12 @@ bool keep_full_speed();
 /// the end succeeds and the work using it stalls, instead of failing the allocation.
 bool gpu_memory_pages();
 
+/// The VRAM in MiB a start leaves free once everything is loaded. Below it a later allocation (a first-used window's
+/// buffers, the desktop, another program) makes a driver that pages GPU memory do so, and a graph spinning on a host flag
+/// then never finishes. A driver that fails such an allocation instead needs room only for what is allocated after
+/// loading (lazily loaded kernels, graphs, a streaming state's residency map).
+inline int vram_floor_mib() { return gpu_memory_pages() ? 256 : 128; }
+
 /// Puts the three standard streams in binary mode where the C runtime defaults them to text, which would turn each
 /// "\n" the serve protocol writes into "\r\n" and fold a "\r\n" in a request to "\n". For a process whose standard
 /// streams are pipes carrying bytes; a console wants its text mode. Nothing to do where text and binary are the same.
