@@ -348,7 +348,8 @@ public:
     }
 
     /// The host blocks the checkpoints take (page-locked, their pages written) and the device buffer a save is
-    /// snapshotted into, held before the models' RAM and VRAM tiers are sized so they plan beside them.
+    /// snapshotted into, held before the models' RAM and VRAM tiers are sized so they plan beside them. The buffer is
+    /// taken only where it leaves the VRAM floor free: without it a save copies out at once.
     void reserve_checkpoints() {
         if (o.prompt_cache <= 0) return;
         const size_t bytes = session().running_bytes();
@@ -356,7 +357,13 @@ public:
         const size_t keep = (size_t) (o.prompt_cache + 1) * (size_t) std::max(o.batch, 1);
         if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
             basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
-        if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        if (free_b < bytes + ((size_t) vram_floor_mib() << 20))
+            basalt::log::info("basalt serve", "checkpoints copy out at once: a %zu MiB buffer to defer them would leave less than "
+                              "%d MiB of VRAM free", bytes >> 20, vram_floor_mib());
+        else if (std::string e; !ckd.reserve(bytes, e))
+            basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
         basalt::core::RunningState rs;   // a split model's second card keeps a spare of its own part
         if (session().running_state(0, false, rs).ok() && !rs.peer_regions.empty()) {
             const basalt::core::OnDevice on(rs.peer_device);
