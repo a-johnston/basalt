@@ -2,7 +2,7 @@
 // controllers, the short convolutions (with the residual and the routed experts' sum), the attention's input
 // preparation, the routed experts' grouping, and the capped logits.
 #include "basalt/models/inkling2x/kernels.hpp"
-#include "q8_1.cuh"
+#include "common.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -197,77 +197,94 @@ __global__ void __launch_bounds__(kCtlThreads) control_out_kernel(CtlJobs jobs, 
 }
 
 // ----------------------------------------------------------------------------------------------- short convolutions
-__global__ void set_position_kernel(int64_t* pos, long long value) { *pos = value; }
+struct Firsts {
+    long long p[kMaxMembers];
+};
+__global__ void set_positions_kernel(int64_t* pos, Members m, Firsts first) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= m.start[m.n]) return;   // Members::rows() is the host's
+    const int i = member_of(m, r);
+    pos[r] = first.p[i] + (r - m.start[i]);
+}
 
-// A thread a channel (of job a's channels, then b's) through every row in order: the three inputs before the first row
-// from the ring, each row's input kept for the next, and the last `keep` rows' inputs written back.  A channel's ring
+// A thread a channel (of job a's channels, then b's) through every row in order, a member at a time: the three inputs
+// before the member's first row from its ring, each row's input kept for the next, and its last rows' inputs written back.  A channel's ring
 // cells are its thread's alone, so the reads and the writes need no ordering across threads.  The arithmetic is the
 // separate kernels' it replaces (the convolution, the experts' sum, the residual add): the same bits.
 constexpr int kConvThreads = 64;
 template<bool SUM, bool RESID>
-__global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, ConvJob b, int hw, ConvRing ring, const int64_t* __restrict__ pos,
-                                                                 int rows, int keep, const float* __restrict__ eout,
+__global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, ConvJob b, int hw, ConvRing ring, Members mem,
+                                                                 const int64_t* __restrict__ pos, const float* __restrict__ eout,
                                                                  const float* __restrict__ ew, int k, float* cur, float* save) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     const bool second = c >= a.C;
     const ConvJob& j = second ? b : a;
     if (second) c -= a.C;
     if (c >= j.C) return;
-    const long long pos0 = *pos;
     const int C = j.C, n_dyn = j.dyn ? C / hw * 4 : 0;
-    float h[3];   // x_(t-3), x_(t-2), x_(t-1)
-#pragma unroll
-    for (int i = 0; i < 3; ++i) {
-        const long long p = pos0 - 3 + i;
-        h[i] = p >= 0 ? ring.data[(size_t) (p % ring.slots) * ring.width + j.ch0 + c] : 0.0f;
-    }
     float w4[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) w4[i] = j.w[(size_t) c * 4 + i];
-    for (int r = 0; r < rows; ++r) {
-        float xt;
-        if constexpr (SUM) {
-            float acc = 0.0f;
-            for (int q = 0; q < k; ++q) acc = acc + eout[((size_t) r * k + q) * C + c] * ew[(size_t) r * k + q];
-            xt = acc;
-        } else {
-            xt = j.x[(size_t) r * C + c];
-        }
-        const float xv[4] = {h[0], h[1], h[2], xt};
-        float acc = 0.0f;
+    for (int m = 0; m < mem.n; ++m) {
+        const int r0 = mem.start[m], r1 = mem.start[m + 1];
+        if (r0 >= r1) continue;
+        float* rg = ring.data[m];
+        const long long pos0 = pos[r0];
+        const int keep = min(r1 - r0, ring.slots - 3);
+        float h[3];   // x_(t-3), x_(t-2), x_(t-1)
 #pragma unroll
-        for (int i = 0; i < 4; ++i) acc += xv[i] * w4[i];
-        if (j.dyn) {
-            const float* tap = j.dyn + (size_t) r * n_dyn + (size_t) (c / hw) * 4;
-#pragma unroll
-            for (int lag = 0; lag < 4; ++lag) acc = acc + xv[3 - lag] * tap[lag];
+        for (int i = 0; i < 3; ++i) {
+            const long long p = pos0 - 3 + i;
+            h[i] = p >= 0 ? rg[(size_t) (p % ring.slots) * ring.width + j.ch0 + c] : 0.0f;
         }
-        const float o = (xv[3] + acc) * j.scale;
-        if (j.out) j.out[(size_t) r * C + c] = o;
-        if constexpr (RESID) {
-            const size_t at = (size_t) r * C + c;
-            if (save) {
-                save[at] = cur[at];
-                cur[at] = o;
+        for (int r = r0; r < r1; ++r) {
+            float xt;
+            if constexpr (SUM) {
+                float acc = 0.0f;
+                for (int q = 0; q < k; ++q) acc = acc + eout[((size_t) r * k + q) * C + c] * ew[(size_t) r * k + q];
+                xt = acc;
             } else {
-                cur[at] += o;
+                xt = j.x[(size_t) r * C + c];
             }
+            const float xv[4] = {h[0], h[1], h[2], xt};
+            float acc = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc += xv[i] * w4[i];
+            if (j.dyn) {
+                const float* tap = j.dyn + (size_t) r * n_dyn + (size_t) (c / hw) * 4;
+#pragma unroll
+                for (int lag = 0; lag < 4; ++lag) acc = acc + xv[3 - lag] * tap[lag];
+            }
+            const float o = (xv[3] + acc) * j.scale;
+            if (j.out) j.out[(size_t) r * C + c] = o;
+            if constexpr (RESID) {
+                const size_t at = (size_t) r * C + c;
+                if (save) {
+                    save[at] = cur[at];
+                    cur[at] = o;
+                } else {
+                    cur[at] += o;
+                }
+            }
+            if (r >= r1 - keep) rg[(size_t) ((pos0 + (r - r0)) % ring.slots) * ring.width + j.ch0 + c] = xt;
+            h[0] = h[1];
+            h[1] = h[2];
+            h[2] = xt;
         }
-        if (r >= rows - keep) ring.data[(size_t) ((pos0 + r) % ring.slots) * ring.width + j.ch0 + c] = xt;
-        h[0] = h[1];
-        h[1] = h[2];
-        h[2] = xt;
     }
 }
 
 // ------------------------------------------------------------------------------------------ the attention's inputs
 // blockIdx.y: n_head Q heads, n_kv K heads, n_kv V heads, then n_head R heads; 128 threads.
 __global__ void qkvr_prep_kernel(float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ rr,
-                                 const float* __restrict__ q_scale, const float* __restrict__ r_scale, PrepArgs a,
-                                 const int64_t* __restrict__ pos, __half* __restrict__ kc, __half* __restrict__ vc, long long cells) {
+                                 const float* __restrict__ q_scale, const float* __restrict__ r_scale, PrepArgs a, Members mem,
+                                 const int64_t* __restrict__ pos, KvCaches caches, long long cells) {
     const int row = blockIdx.x, seg = blockIdx.y, d = threadIdx.x;
     __shared__ float red[32];
-    const long long p = *pos + row;
+    const long long p = pos[row];
+    const int mi = member_of(mem, row);
+    __half* kc = (__half*) caches.k[mi];
+    __half* vc = (__half*) caches.v[mi];
     const float tau = a.log_scale ? 1.0f + a.log_alpha * logf(fmaxf((float) (p + 1) * (1.0f / a.log_floor), 1.0f)) : 1.0f;
     const size_t cell = (size_t) (p % cells);
     if (seg < a.n_head) {   // Q
@@ -358,8 +375,11 @@ __global__ void cap_logits_kernel(const float* __restrict__ x, int ld, int n_voc
 
 }  // namespace
 
-void set_position(int64_t* pos, int64_t value, void* stream) {
-    set_position_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(pos, (long long) value);
+void set_positions(int64_t* pos, const Members& m, const int64_t* first, void* stream) {
+    if (m.rows() <= 0) return;
+    Firsts f{};
+    for (int i = 0; i < m.n && i < kMaxMembers; ++i) f.p[i] = (long long) first[i];
+    set_positions_kernel<<<(unsigned) ((m.rows() + 127) / 128), 128, 0, (cudaStream_t) stream>>>(pos, m, f);
 }
 
 void depth_mix(const States& s, const float* queries, int nq, int rows, int n_embd, float eps, float* out, void* stream) {
@@ -391,34 +411,32 @@ void loop_control(const CtlJob* jobs, int n, int rows, int n_embd, int rank, flo
         a, rows, n_embd, rank, g);
 }
 
-void conv_rows(const ConvJob& a, const ConvJob* b, int head_width, const ConvRing& ring, const int64_t* pos, int rows, int keep,
+void conv_rows(const ConvJob& a, const ConvJob* b, int head_width, const ConvRing& ring, const Members& m, const int64_t* pos,
                void* stream) {
-    if (rows <= 0) return;
+    if (m.rows() <= 0) return;
     const ConvJob none;
     const int C = a.C + (b ? b->C : 0);
     conv_rows_kernel<false, false><<<(unsigned) ((C + kConvThreads - 1) / kConvThreads), kConvThreads, 0, (cudaStream_t) stream>>>(
-        a, b ? *b : none, head_width, ring, pos, rows, std::min(keep, rows), nullptr, nullptr, 0, nullptr, nullptr);
+        a, b ? *b : none, head_width, ring, m, pos, nullptr, nullptr, 0, nullptr, nullptr);
 }
 
 void conv_residual(const ConvJob& a, const float* eout, const float* ew, int k, int head_width, const ConvRing& ring,
-                   const int64_t* pos, int rows, int keep, float* cur, float* save, void* stream) {
-    if (rows <= 0) return;
+                   const Members& m, const int64_t* pos, float* cur, float* save, void* stream) {
+    if (m.rows() <= 0) return;
     const ConvJob none;
     const dim3 grid((unsigned) ((a.C + kConvThreads - 1) / kConvThreads));
     cudaStream_t st = (cudaStream_t) stream;
     if (eout)
-        conv_rows_kernel<true, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, pos, rows, std::min(keep, rows), eout, ew,
-                                                                     k, cur, save);
+        conv_rows_kernel<true, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, m, pos, eout, ew, k, cur, save);
     else
-        conv_rows_kernel<false, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, pos, rows, std::min(keep, rows), nullptr,
-                                                                      nullptr, 0, cur, save);
+        conv_rows_kernel<false, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, m, pos, nullptr, nullptr, 0, cur, save);
 }
 
 void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* q_scale, const float* r_scale, const PrepArgs& a,
-               const int64_t* pos, int rows, uint16_t* k_cache, uint16_t* v_cache, int64_t cells, void* stream) {
-    if (rows <= 0) return;
-    qkvr_prep_kernel<<<dim3((unsigned) rows, (unsigned) (2 * a.n_head + 2 * a.n_kv)), 128, 0, (cudaStream_t) stream>>>(
-        q, k, v, r, q_scale, r_scale, a, pos, (__half*) k_cache, (__half*) v_cache, cells);
+               const Members& m, const int64_t* pos, const KvCaches& caches, int64_t cells, void* stream) {
+    if (m.rows() <= 0) return;
+    qkvr_prep_kernel<<<dim3((unsigned) m.rows(), (unsigned) (2 * a.n_head + 2 * a.n_kv)), 128, 0, (cudaStream_t) stream>>>(
+        q, k, v, r, q_scale, r_scale, a, m, pos, caches, cells);
 }
 
 void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* expert_ptr, const Exl3Rates* expert_rates,

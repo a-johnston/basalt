@@ -1,8 +1,9 @@
-// src/models/inkling2x/kernels/q8_1.cuh - device code shared by Inkling 2's kernel files (no kernels): the q8_1 block the
-// quantized matvecs read, written as quantize_q8_1_rows writes it.
+// src/models/inkling2x/kernels/common.cuh - device code shared by Inkling 2's kernel files (no kernels): the q8_1 block the
+// quantized matvecs read, written as quantize_q8_1_rows writes it, and a row's member of a batch.
 #pragma once
 
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/models/inkling2x/kernels.hpp"
 
 #include <cuda_fp16.h>
 
@@ -29,6 +30,13 @@ __device__ __forceinline__ void q8_1_value(const float xi, Q81* __restrict__ y, 
     const long long ib = i / 32, iqs = i % 32;
     y[ib].qs[iqs] = ::basalt::kernels::q8_1_quant(xi, d, amax);
     if (iqs == 0) y[ib].ds = ::basalt::kernels::q8_1_ds(d, sum);
+}
+
+// the member whose rows hold `row`
+__device__ __forceinline__ int member_of(const Members& m, int row) {
+    int i = 0;
+    while (i + 1 < m.n && row >= m.start[i + 1]) ++i;
+    return i;
 }
 
 }  // namespace basalt::models::inkling2x::kernels

@@ -58,7 +58,7 @@ private:
     std::string diag_dump_;
 };
 
-/// A session over `model`; null with `err` set.
-std::unique_ptr<model::ModelSession> make_session(Inkling2Model& model, std::string& err);
+/// `n` sessions over `model`, which share the forward's scratch (they run one after another).
+model::Result make_sessions(Inkling2Model& model, int n, std::vector<std::unique_ptr<model::ModelSession>>& sessions);
 
 }  // namespace basalt::models::inkling2x

@@ -39,12 +39,32 @@ std::vector<float> randn(size_t n, float s = 1.0f) {
     return v;
 }
 
-// a device word holding a position, for the kernels that read theirs from one
-const int64_t* dpos(int64_t p) {
+// one conversation of `rows` rows
+k::Members members1(int rows) {
+    k::Members m;
+    m.start[1] = rows;
+    return m;
+}
+// the rows' positions on the card, from each member's first
+const int64_t* rowpos(const k::Members& m, const std::vector<int64_t>& first) {
     int64_t* d = nullptr;
-    cudaMalloc(&d, sizeof(int64_t));
-    cudaMemcpy(d, &p, sizeof(int64_t), cudaMemcpyHostToDevice);
+    cudaMalloc(&d, (size_t) std::max(m.rows(), 1) * sizeof(int64_t));
+    k::set_positions(d, m, first.data(), nullptr);
     return d;
+}
+const int64_t* rowpos(int64_t first, int rows) { return rowpos(members1(rows), {first}); }
+k::ConvRing ring1(float* d, int slots, int width) {
+    k::ConvRing r;
+    r.data[0] = d;
+    r.slots = slots;
+    r.width = width;
+    return r;
+}
+k::KvCaches caches1(void* kc, void* vc) {
+    k::KvCaches c;
+    c.k[0] = (uint16_t*) kc;
+    c.v[0] = (uint16_t*) vc;
+    return c;
 }
 
 template <class T> T* up(const std::vector<T>& v) {
@@ -271,10 +291,10 @@ void check_conv() {
         auto xa = randn((size_t) R * CA), xb = randn((size_t) R * CB), wa = randn((size_t) CA * 4, 0.3f), wb = randn((size_t) CB * 4, 0.3f);
         auto dy = randn((size_t) R * (CA / HW) * 4, 0.3f), ringh = randn((size_t) SLOTS * WIDTH);
         float* ringd = up(ringh);
-        const k::ConvRing ring{ringd, SLOTS, WIDTH};
+        const k::ConvRing ring = ring1(ringd, SLOTS, WIDTH);
         k::ConvJob a{up(xa), up(wa), up(dy), zeros<float>((size_t) R * CA), 0, CA, 1.0f / std::sqrt(9.0f)};
         k::ConvJob b{up(xb), up(wb), nullptr, zeros<float>((size_t) R * CB), CA, CB, 1.0f / std::sqrt(5.0f)};
-        k::conv_rows(a, &b, HW, ring, dpos(pos0), R, keep, nullptr);
+        k::conv_rows(a, &b, HW, ring, members1(R), rowpos(pos0, R), nullptr);
         std::vector<double> ref;
         std::vector<float> got;
         for (int r = 0; r < R; ++r)
@@ -296,11 +316,11 @@ void check_conv() {
         std::printf("%-34s %s\n", R == 5 ? "conv ring keeps the last rows" : "conv ring, 40 rows", ok ? "ok" : "FAIL");
         failures += !ok;
         if (R == 5) {   // its first row alone (the ring as before)
-            float* ring1 = up(ringh);
+            float* ringd1 = up(ringh);
             k::ConvJob a1 = a, b1 = b;
             a1.out = zeros<float>(CA);
             b1.out = zeros<float>(CB);
-            k::conv_rows(a1, &b1, HW, {ring1, SLOTS, WIDTH}, dpos(pos0), 1, 1, nullptr);
+            k::conv_rows(a1, &b1, HW, ring1(ringd1, SLOTS, WIDTH), members1(1), rowpos(pos0, 1), nullptr);
             same("short convs", down(a1.out, CA).data(), got.data(), CA);
         }
     }
@@ -308,7 +328,7 @@ void check_conv() {
     {
         auto x = randn(CA), w = randn((size_t) CA * 4, 0.3f), ringh = randn((size_t) SLOTS * WIDTH);
         k::ConvJob a{up(x), up(w), nullptr, zeros<float>(CA), 0, CA, 1.0f};
-        k::conv_rows(a, nullptr, HW, {up(ringh), SLOTS, WIDTH}, dpos(1), 1, 1, nullptr);
+        k::conv_rows(a, nullptr, HW, ring1(up(ringh), SLOTS, WIDTH), members1(1), rowpos(1, 1), nullptr);
         std::vector<double> r1(CA);
         for (int c = 0; c < CA; ++c) r1[c] = conv_ref(x, w, nullptr, ringh, WIDTH, SLOTS, 0, CA, 1, 0, c, 1.0);
         report("short conv at position 1", down(a.out, CA), r1, 1e-6);
@@ -331,8 +351,8 @@ void check_conv() {
                     in[(size_t) r * CR + c] = (float) acc;
                 }
         k::ConvJob a{mode == 2 ? nullptr : up(x), up(w), nullptr, nullptr, 2048, CR, scale};
-        k::conv_residual(a, mode == 2 ? up(eo) : nullptr, mode == 2 ? up(ew) : nullptr, KTOP, HW, {up(ringh), SLOTS, WIDTH}, dpos(pos0), R,
-                         R, cur, save, nullptr);
+        k::conv_residual(a, mode == 2 ? up(eo) : nullptr, mode == 2 ? up(ew) : nullptr, KTOP, HW, ring1(up(ringh), SLOTS, WIDTH), members1(R),
+                         rowpos(pos0, R), cur, save, nullptr);
         std::vector<double> ref((size_t) R * CR);
         for (int r = 0; r < R; ++r)
             for (int c = 0; c < CR; ++c) {
@@ -384,7 +404,7 @@ void check_attention(bool full, int R) {
     pa.log_floor = 8192.0f;
     // a prompt past the log-scale floor: positions where tau > 1
     const int64_t ppos = full ? 9000 : pos0;
-    k::qkvr_prep(q, kd, vd, r, qs, rs, pa, dpos(ppos), R, (uint16_t*) kcd, (uint16_t*) vcd, cells, nullptr);
+    k::qkvr_prep(q, kd, vd, r, qs, rs, pa, members1(R), rowpos(ppos, R), caches1(kcd, vcd), cells, nullptr);
     // the reference preparation
     std::vector<double> qr((size_t) R * H * D), rr((size_t) R * H * DREL);
     for (int row = 0; row < R; ++row) {
@@ -438,7 +458,7 @@ void check_attention(bool full, int R) {
     cudaMalloc(&ws, k::attention_workspace_bytes(R, H, maxk));
     float* out = zeros<float>((size_t) R * H * D);
     void* oq = zeros<uint8_t>((size_t) R * H * D / 32 * 36);
-    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, R, ws, out, oq, nullptr);
+    k::attention(q, r, sink, gate, rb, caches1(kcd, vcd), aa, members1(R), rowpos(apos, R), apos + R - 1, ws, out, oq, nullptr);
     const auto qg = down(q, qr.size()), rg = down(r, rr.size());
     const auto kb = down(kcd, kc.size()), vb = down(vcd, vc.size());
     std::vector<double> ref((size_t) R * H * D);
@@ -489,8 +509,89 @@ void check_attention(bool full, int R) {
     }
     report(full ? "attention, full layer (> extent)" : "attention, sliding (wrapped ring)", got, ref, 1e-4);
     float* one = zeros<float>((size_t) H * D);
-    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, 1, ws, one, nullptr, nullptr);
+    k::attention(q, r, sink, gate, rb, caches1(kcd, vcd), aa, members1(1), rowpos(apos, 1), apos, ws, one, nullptr, nullptr);
     same(full ? "attention, full layer" : "attention, sliding", down(one, (size_t) H * D).data(), got.data(), (size_t) H * D);
+}
+
+// ------------------------------------------------------------------------------------------ several conversations a run
+// Two members in one launch, each with its own ring and caches at its own positions, against each member alone: the
+// convolutions (and their rings), the attention's inputs (and the caches they write) and the attention, bit for bit.
+void check_members() {
+    const int SLOTS = 32, WIDTH = 6656, HW = 128, CK = 1024;
+    const int n0 = 2, n1 = 3, R = n0 + n1;
+    const int64_t p0 = 37, p1 = 1500, cells = 16384;
+    k::Members two;
+    two.n = 2;
+    two.start[1] = n0;
+    two.start[2] = R;
+    const int64_t* pos2 = rowpos(two, {p0, p1});
+    bool ok = true;
+    // convolutions: K with input taps
+    {
+        auto x = randn((size_t) R * CK), w = randn((size_t) CK * 4, 0.3f), dy = randn((size_t) R * (CK / HW) * 4, 0.3f);
+        auto ra = randn((size_t) SLOTS * WIDTH), rb = randn((size_t) SLOTS * WIDTH);
+        float *ra2 = up(ra), *rb2 = up(rb), *ra1 = up(ra), *rb1 = up(rb), *xd = up(x), *wd = up(w), *dyd = up(dy);
+        k::ConvRing ring = ring1(ra2, SLOTS, WIDTH);
+        ring.data[1] = rb2;
+        k::ConvJob j{xd, wd, dyd, zeros<float>((size_t) R * CK), 0, CK, 1.0f / std::sqrt(9.0f)};
+        k::conv_rows(j, nullptr, HW, ring, two, pos2, nullptr);
+        k::ConvJob j0 = j, j1 = j;
+        j0.out = zeros<float>((size_t) n0 * CK);
+        j1.x = xd + (size_t) n0 * CK;
+        j1.dyn = dyd + (size_t) n0 * (CK / HW) * 4;
+        j1.out = zeros<float>((size_t) n1 * CK);
+        k::conv_rows(j0, nullptr, HW, ring1(ra1, SLOTS, WIDTH), members1(n0), rowpos(p0, n0), nullptr);
+        k::conv_rows(j1, nullptr, HW, ring1(rb1, SLOTS, WIDTH), members1(n1), rowpos(p1, n1), nullptr);
+        const auto both = down(j.out, (size_t) R * CK), a = down(j0.out, (size_t) n0 * CK), b = down(j1.out, (size_t) n1 * CK);
+        ok &= std::memcmp(both.data(), a.data(), a.size() * 4) == 0 && std::memcmp(both.data() + a.size(), b.data(), b.size() * 4) == 0;
+        ok &= down(ra2, ra.size()) == down(ra1, ra.size()) && down(rb2, rb.size()) == down(rb1, rb.size());
+    }
+    // the attention's inputs and the attention, a full layer
+    {
+        auto q = randn((size_t) R * H * D), kk = randn((size_t) R * HKV * D), v = randn((size_t) R * HKV * D), r = randn((size_t) R * H * DREL);
+        auto sink = randn((size_t) R * H, 2.0f), gate = randn((size_t) R * H * D), qs = randn((size_t) H * D), rs = randn((size_t) H * DREL);
+        auto rbias = randn((size_t) EXT * DREL, 0.5f);
+        std::vector<__half> ca((size_t) cells * HKV * D), cb(ca.size());
+        std::normal_distribution<float> nd(0.0f, 0.1f);
+        for (size_t i = 0; i < ca.size(); ++i) { ca[i] = __float2half(nd(rng)); cb[i] = __float2half(nd(rng)); }
+        k::PrepArgs pa;
+        pa.qk_clip = 22.6274f;
+        pa.r_clip = 8.0f;
+        pa.log_scale = true;
+        pa.log_alpha = 0.1f;
+        pa.log_floor = 8.0f;   // tau > 1 at both members' positions
+        k::AttnArgs aa;
+        aa.cells = cells;
+        void* ws = nullptr;
+        cudaMalloc(&ws, k::attention_workspace_bytes(R, H, cells));
+        // both members in one run
+        float *q2 = up(q), *r2 = up(r), *sd = up(sink), *gd = up(gate), *qsd = up(qs), *rsd = up(rs), *rbd = up(rbias), *kd = up(kk), *vd = up(v);
+        __half *ka2 = up(ca), *va2 = up(cb), *kb2 = up(cb), *vb2 = up(ca);
+        k::KvCaches c2 = caches1(ka2, va2);
+        c2.k[1] = (uint16_t*) kb2;
+        c2.v[1] = (uint16_t*) vb2;
+        k::qkvr_prep(q2, kd, vd, r2, qsd, rsd, pa, two, pos2, c2, cells, nullptr);
+        float* o2 = zeros<float>((size_t) R * H * D);
+        k::attention(q2, r2, sd, gd, rbd, c2, aa, two, pos2, p1 + n1 - 1, ws, o2, nullptr, nullptr);
+        // each alone, on copies of its caches
+        float *qa = up(q), *ra = up(r), *oa = zeros<float>((size_t) n0 * H * D), *ob = zeros<float>((size_t) n1 * H * D);
+        __half *ka1 = up(ca), *va1 = up(cb), *kb1 = up(cb), *vb1 = up(ca);
+        k::qkvr_prep(qa, kd, vd, ra, qsd, rsd, pa, members1(n0), rowpos(p0, n0), caches1(ka1, va1), cells, nullptr);
+        k::attention(qa, ra, sd, gd, rbd, caches1(ka1, va1), aa, members1(n0), rowpos(p0, n0), p0 + n0 - 1, ws, oa, nullptr, nullptr);
+        const size_t qo = (size_t) n0 * H * D, ro = (size_t) n0 * H * DREL;
+        k::qkvr_prep(qa + qo, kd + (size_t) n0 * HKV * D, vd + (size_t) n0 * HKV * D, ra + ro, qsd, rsd, pa, members1(n1), rowpos(p1, n1),
+                     caches1(kb1, vb1), cells, nullptr);
+        k::attention(qa + qo, ra + ro, sd + (size_t) n0 * H, gd + qo, rbd, caches1(kb1, vb1), aa, members1(n1), rowpos(p1, n1), p1 + n1 - 1, ws,
+                     ob, nullptr, nullptr);
+        const auto both = down(o2, (size_t) R * H * D), a = down(oa, qo), b = down(ob, (size_t) n1 * H * D);
+        ok &= std::memcmp(both.data(), a.data(), a.size() * 4) == 0 && std::memcmp(both.data() + a.size(), b.data(), b.size() * 4) == 0;
+        for (auto [x2, x1] : {std::pair{ka2, ka1}, {va2, va1}, {kb2, kb1}, {vb2, vb1}}) {
+            const auto u = down(x2, ca.size()), w = down(x1, ca.size());
+            ok &= std::memcmp(u.data(), w.data(), u.size() * sizeof(__half)) == 0;
+        }
+    }
+    std::printf("%-34s %s\n", "two members vs each alone", ok ? "bit for bit" : "FAIL");
+    failures += !ok;
 }
 
 // ----------------------------------------------------------------------------------------------- the routed experts
@@ -745,6 +846,7 @@ int main(int argc, char** argv) {
     check_control();
     check_norm_quant();
     check_conv();
+    check_members();
     check_attention(false, 3);
     check_attention(true, 3);
     check_attention(false, 17);

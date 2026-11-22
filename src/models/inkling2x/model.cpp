@@ -134,13 +134,7 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
 }
 
 model::Result Inkling2Model::attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
-    std::string err;
-    for (int i = 0; i < std::max(req.sessions, 1); ++i) {
-        auto s = make_session(*this, err);
-        if (!s) return {model::Status::Error, "inkling2x: " + err};
-        sessions.push_back(std::move(s));
-    }
-    return {};
+    return make_sessions(*this, std::max(req.sessions, 1), sessions);
 }
 
 }  // namespace basalt::models::inkling2x
