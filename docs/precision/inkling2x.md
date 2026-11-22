@@ -58,6 +58,23 @@ Against a double-precision reference at model geometry, the grouped EXL3 expert 
 relative error of 5.94e-7 (0.0218 absolute on outputs of order 10^4). Its output equals separate uniform-rate calls bit for bit,
 including each row run alone. This tests arithmetic on the same quantized weights, not quantization loss.
 
+## The drafter
+
+The DSpark drafter only proposes tokens: the target verifies every one, so greedy output with drafting is the same as without
+(checked token for token on three 400-token fixtures at windows of 3, 4, 5 and 8, and on four server requests). Its precision
+sets acceptance only:
+
+- **Weights:** the projections and MLPs Q8_0 from the checkpoint's BF16; the norms and the Markov head's recurrent projection
+  F32; its token table BF16; its output folded through the pack's Q8_0 head in double, then BF16. The base logits come from the
+  same Q8_0 head the target reads, not vLLM's BF16 one.
+- **Arithmetic:** fp32 throughout, where vLLM rounds its block's activations and the Markov head's state to BF16; the target's
+  features are BF16 as in vLLM; K and V in fp16 caches.
+- **Checks:** run on the engine's own features, a double-precision reference of vLLM's formulas gives the same seven drafts in
+  every block tested (hidden states within 7e-3 relative). Kernel parity against double (`inkling2x_dspark_parity`): the fp32
+  stages within 3e-5 relative (the queries' RoPE, from fp32 angles as vLLM's table) and most within 3e-7, the fp16 caches within
+  3e-4, every q8_1 block as `quantize_q8_1_rows` makes it, and the vocabulary-wide pick the same token, its probability within
+  3e-6.
+
 ## Reproduce the decode gate
 
 BF16 reference: llama.cpp `eb550aaa5`, `convert_hf_to_gguf.py --outtype bf16`. `llama-perplexity` reports 7.0729 ± 0.1090 over

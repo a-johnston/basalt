@@ -305,3 +305,13 @@ python3 tools/convert/convert.py --sections-from Inkling-2-Mini-IQ3_XXS-test.bas
   taps squeezed, a full layer's static taps reversed, the relative-bias tables transposed, the loop's cross-pass queries
   stacked per core layer). The checkpoint's BF16 and F32 tensors equal the official checkpoint's bit for bit.
 - `meta.exl3`: the experts' rates (`gate-up/down bpw -> experts`) and how the dense tensors were made.
+- `dspark/gguf` (optional): the DSpark drafter the checkpoint ships (`mtp.safetensors`, with the `mtp_config` of the
+  `config.json` beside it), attached to a pack that exists (`tools/convert/dspark_inkling2x.py`): the projections and MLPs as
+  Q8_0, the norms, mask row, feature weights and the Markov head's recurrent projection as F32, its token table as BF16, and its
+  output folded through the pack's own head in double (BF16). `meta.dspark` holds the config and each tensor's offset; 477 MiB
+  for the official drafter. With it the engine drafts (`--spec`); `--spec 0` leaves it unloaded.
+
+```sh
+python3 tools/convert/convert.py --dspark Inkling-2-Mini/mtp.safetensors --into Inkling-2-Mini-SAGE-REXL3-2.92bpw.basalt \
+    --undo-dir DIR
+```
