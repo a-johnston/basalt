@@ -73,11 +73,12 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
     for (int i = threadIdx.x; i < G * nt; i += blockDim.x) {
         const int hh = i / nt, h = g * G + hh;
         const long long e = t0 + i % nt;
-        const float* rq = r + ((size_t) row * a.n_head + h) * a.d_rel;
         float t = 0.0f;
-        if (e < a.extent)
+        if (rel_bias && e < a.extent) {
+            const float* rq = r + ((size_t) row * a.n_head + h) * a.d_rel;
             for (int j = 0; j < a.d_rel; ++j) t += rel_bias[(size_t) e * a.d_rel + j] * rq[j];
-        tab[hh][i % nt] = t - sinks[(size_t) row * a.n_head + h];
+        }
+        tab[hh][i % nt] = sinks ? t - sinks[(size_t) row * a.n_head + h] : t;
     }
     float qv[G][kPer];
 #pragma unroll
@@ -174,13 +175,13 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
 
 // out, and with xq set its q8_1 blocks (a head's 128 values are four blocks, a warp each)
 __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __restrict__ gate, int n_head, int rows, int nsplit,
-                                 float* __restrict__ out, Q81* __restrict__ xq) {
+                                 bool sink_logit, float* __restrict__ out, Q81* __restrict__ xq) {
     const int row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const size_t base = ((size_t) row * n_head + h) * nsplit;
     const float* wsm = ws, *wsl = ws + (size_t) rows * n_head * nsplit, *wsa = ws + 2 * (size_t) rows * n_head * nsplit;
-    float m = 0.0f;   // the sink's logit
+    float m = sink_logit ? 0.0f : -INFINITY;   // the sink's logit
     for (int s = 0; s < nsplit; ++s) m = fmaxf(m, wsm[base + s]);
-    float l = expf(0.0f - m), o = 0.0f;
+    float l = sink_logit ? expf(0.0f - m) : 0.0f, o = 0.0f;
     for (int s = 0; s < nsplit; ++s) {
         if (wsm[base + s] == -INFINITY) continue;
         const float c = expf(wsm[base + s] - m);
@@ -188,7 +189,7 @@ __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __re
         o += wsa[(base + s) * kHead + d] * c;
     }
     const size_t at = ((size_t) row * n_head + h) * kHead + d;
-    const float v = (o / l) * (1.0f / (1.0f + expf(-gate[at])));
+    const float v = gate ? (o / l) * (1.0f / (1.0f + expf(-gate[at]))) : o / l;
     out[at] = v;
     if (xq) q8_1_value(v, xq, (long long) at);
 }
@@ -226,8 +227,8 @@ void attention(const float* q, const float* r, const float* sinks, const float* 
 #undef X
         default: basalt::log::error("basalt inkling2x", "attention: %d query heads a K/V head", a.n_head / a.n_kv); std::exit(1);
     }
-    attn_join_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head), kHead, 0, st>>>((const float*) ws, gate, a.n_head, rows, nsplit, out,
-                                                                                (Q81*) out_q8_1);
+    attn_join_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head), kHead, 0, st>>>((const float*) ws, gate, a.n_head, rows, nsplit,
+                                                                                a.sink_logit, out, (Q81*) out_q8_1);
 }
 
 }  // namespace basalt::models::inkling2x::kernels
