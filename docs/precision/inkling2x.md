@@ -66,6 +66,9 @@ weights and q8_1 inputs by at most 2.61e-5 absolute, 4.01e-7 relative to the pea
 largest difference is on IQ2_S (8.02e-4 absolute, 3.19e-5 relative): the matvec truncates a fractional sub-block scale
 inside its integer dot. The repacked codes, widened scales and padding agree byte for byte with the host reference.
 
+The prompt convolutions split each channel across row slices. Their outputs, residuals and complete rings (including cells
+not written by the chunk) match the serial convolutions bit for bit, including at a ring wrap and at the start of a prompt.
+
 ## The drafter
 
 The DSpark drafter only proposes tokens: the target verifies every one, so greedy output with drafting is the same as without

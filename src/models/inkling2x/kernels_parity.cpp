@@ -284,10 +284,25 @@ double conv_ref(const std::vector<float>& x, const std::vector<float>& w, const 
     return (xv[3] + acc) * scale;
 }
 
-void check_conv() {
-    const int SLOTS = 32, WIDTH = 6656, HW = 128, CA = 1024, CB = 1024, CR = 2304;
-    for (int R : {5, 40}) {   // a decode window; a prompt run longer than the ring
-        const int64_t pos0 = 37;
+// An empty second member keeps exactly the same row range and uses the serial multi-member kernel.
+k::Members serial_conv(int rows) {
+    auto m = members1(rows);
+    m.n = 2;
+    m.start[2] = rows;
+    return m;
+}
+void same_conv(const float* a, const float* b, size_t n) {
+    const auto x = down(a, n), y = down(b, n);
+    const bool ok = std::memcmp(x.data(), y.data(), n * sizeof(float)) == 0;
+    std::printf("%-34s %s\n", "sliced vs serial convolution", ok ? "bit for bit" : "FAIL");
+    failures += !ok;
+}
+void check_conv(bool prompt_test = false, bool bench = false) {
+    const int SLOTS = 32, WIDTH = 6656, HW = 128, CA = 1024, CR = 2304;
+    for (int n : {0, 1}) {
+        const int R = prompt_test ? (n ? 128 : 17) : (n ? 40 : 5);
+        const int CB = R == 17 ? 1025 : 1024;   // a partial channel tile at the end of the second job
+        const int64_t pos0 = R == 17 ? 1 : 37;
         const int keep = std::min(R, SLOTS - 3);
         auto xa = randn((size_t) R * CA), xb = randn((size_t) R * CB), wa = randn((size_t) CA * 4, 0.3f), wb = randn((size_t) CB * 4, 0.3f);
         auto dy = randn((size_t) R * (CA / HW) * 4, 0.3f), ringh = randn((size_t) SLOTS * WIDTH);
@@ -306,7 +321,7 @@ void check_conv() {
             const auto o = down(jb->out, (size_t) R * jb->C);
             got.insert(got.end(), o.begin(), o.end());
         }
-        report(R == 5 ? "short convs, two jobs" : "short convs, 40 rows", got, ref, 1e-6);
+        report(R == 5 ? "short convs, two jobs" : "prompt convs, two jobs", got, ref, 1e-6);
         // the ring: the last `keep` rows' inputs at their positions, the other cells as they were
         const auto rg = down(ringd, ringh.size());
         std::vector<float> want = ringh;
@@ -314,9 +329,19 @@ void check_conv() {
             for (int c = 0; c < CA + CB; ++c)
                 want[(size_t) ((pos0 + r) % SLOTS) * WIDTH + c] = c < CA ? xa[(size_t) r * CA + c] : xb[(size_t) r * CB + c - CA];
         const bool ok = rg == want;
-        std::printf("%-34s %s\n", R == 5 ? "conv ring keeps the last rows" : "conv ring, 40 rows", ok ? "ok" : "FAIL");
+        std::printf("%-34s %s\n", R == 5 ? "conv ring keeps the last rows" : "prompt conv ring", ok ? "ok" : "FAIL");
         failures += !ok;
-        if (R == 5) {   // its first row alone (the ring as before)
+        if (prompt_test) {
+            auto a2 = a, b2 = b;
+            a2.out = zeros<float>((size_t) R * CA);
+            b2.out = zeros<float>((size_t) R * CB);
+            auto* rg2 = up(ringh);
+            k::conv_rows(a2, &b2, HW, ring1(rg2, SLOTS, WIDTH), serial_conv(R), rowpos(pos0, R), nullptr);
+            same_conv(a.out, a2.out, (size_t) R * CA);
+            same_conv(b.out, b2.out, (size_t) R * CB);
+            same_conv(ringd, rg2, ringh.size());
+        }
+        if (R == 5 || prompt_test) {   // its first row alone (the ring as before)
             float* ringd1 = up(ringh);
             k::ConvJob a1 = a, b1 = b;
             a1.out = zeros<float>(CA);
@@ -335,8 +360,8 @@ void check_conv() {
         report("short conv at position 1", down(a.out, CA), r1, 1e-6);
     }
     // into the residual: added, a block's start (saved and replaced), and the experts' sum as the input
-    const int R = 5;
-    const int64_t pos0 = 37;
+    const int R = prompt_test ? 128 : 5;
+    const int64_t pos0 = prompt_test ? 1 : 37;
     auto x = randn((size_t) R * CR), w = randn((size_t) CR * 4, 0.3f), curh = randn((size_t) R * CR), ringh = randn((size_t) SLOTS * WIDTH);
     auto eo = randn((size_t) R * KTOP * CR), ew = randn((size_t) R * KTOP, 0.3f);
     const float scale = 1.0f / std::sqrt(5.0f);
@@ -352,8 +377,34 @@ void check_conv() {
                     in[(size_t) r * CR + c] = (float) acc;
                 }
         k::ConvJob a{mode == 2 ? nullptr : up(x), up(w), nullptr, nullptr, 2048, CR, scale};
-        k::conv_residual(a, mode == 2 ? up(eo) : nullptr, mode == 2 ? up(ew) : nullptr, KTOP, HW, ring1(up(ringh), SLOTS, WIDTH), members1(R),
-                         rowpos(pos0, R), cur, save, nullptr);
+        const auto *d_eo = mode == 2 ? up(eo) : nullptr, *d_ew = mode == 2 ? up(ew) : nullptr;
+        const auto* pos = rowpos(pos0, R);
+        auto run = [&](k::Members m, float* rg, float* dst, float* saved) {
+            k::conv_residual(a, d_eo, d_ew, KTOP, HW, ring1(rg, SLOTS, WIDTH), m, pos, dst, saved, nullptr);
+        };
+        auto* rg = up(ringh);
+        run(members1(R), rg, cur, save);
+        if (prompt_test) {
+            auto *rg2 = up(ringh), *cur2 = up(curh), *save2 = save ? zeros<float>(curh.size()) : nullptr;
+            run(serial_conv(R), rg2, cur2, save2);
+            same_conv(rg, rg2, ringh.size());
+            same_conv(cur, cur2, curh.size());
+            if (save) same_conv(save, save2, curh.size());
+            if (bench && mode == 2) {
+                for (auto m : {serial_conv(R), members1(R)}) {
+                    cudaEvent_t t0, t1;
+                    cudaEventCreate(&t0); cudaEventCreate(&t1);
+                    cudaEventRecord(t0);
+                    for (int it = 0; it < 100; ++it) run(m, rg2, cur2, nullptr);
+                    cudaEventRecord(t1); cudaEventSynchronize(t1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, t0, t1);
+                    std::printf("%s expert sum + convolution: %.2f us, %.1f GB/s of expert outputs\n",
+                                m.n == 2 ? "serial" : "sliced", ms * 10, eo.size() * sizeof(float) / (ms * 1e4));
+                    cudaEventDestroy(t0); cudaEventDestroy(t1);
+                }
+            }
+        }
         std::vector<double> ref((size_t) R * CR);
         for (int r = 0; r < R; ++r)
             for (int c = 0; c < CR; ++c) {
@@ -931,6 +982,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
         check_projections(true);
         check_exl3_experts(true);
+        check_conv(true, true);
         return failures ? 1 : 0;
     }
     check_mix();
@@ -946,6 +998,7 @@ int main(int argc, char** argv) {
     check_exl3_experts();
     check_logits();
     check_projections(false);
+    check_conv(true);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         std::printf("CUDA error: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;

@@ -207,16 +207,21 @@ __global__ void set_positions_kernel(int64_t* pos, Members m, Firsts first) {
     pos[r] = first.p[i] + (r - m.start[i]);
 }
 
-// A thread a channel (of job a's channels, then b's) through every row in order, a member at a time: the three inputs
-// before the member's first row from its ring, each row's input kept for the next, and its last rows' inputs written back.  A channel's ring
-// cells are its thread's alone, so the reads and the writes need no ordering across threads.  The arithmetic is the
-// separate kernels' it replaces (the convolution, the experts' sum, the residual add): the same bits.
+// Decode walks a channel's rows in order. A prompt block owns a set of channels, one thread per channel and row slice.
 constexpr int kConvThreads = 64;
-template<bool SUM, bool RESID>
-__global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, ConvJob b, int hw, ConvRing ring, Members mem,
-                                                                 const int64_t* __restrict__ pos, const float* __restrict__ eout,
-                                                                 const float* __restrict__ ew, int k, float* cur, float* save) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
+constexpr int kConvSlices = 8, kConvChannels = 16;
+template<bool SUM>
+__device__ __forceinline__ float conv_input(const ConvJob& j, const float* eout, const float* ew, int k, int r, int c) {
+    if constexpr (SUM) {
+        float acc = 0.0f;
+        for (int q = 0; q < k; ++q) acc = acc + eout[((size_t) r * k + q) * j.C + c] * ew[(size_t) r * k + q];
+        return acc;
+    } else return j.x[(size_t) r * j.C + c];
+}
+template<bool SUM, bool RESID, bool SLICED>
+__device__ __forceinline__ void conv_rows_stage(int c, int slice, ConvJob a, ConvJob b, int hw, ConvRing ring, Members mem,
+                                                const int64_t* __restrict__ pos, const float* __restrict__ eout,
+                                                const float* __restrict__ ew, int k, float* cur, float* save) {
     const bool second = c >= a.C;
     const ConvJob& j = second ? b : a;
     if (second) c -= a.C;
@@ -231,21 +236,20 @@ __global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, Conv
         float* rg = ring.data[m];
         const long long pos0 = pos[r0];
         const int keep = min(r1 - r0, ring.slots - 3);
+        const int begin = SLICED ? r0 + (r1 - r0) * slice / kConvSlices : r0;
+        const int end = SLICED ? r0 + (r1 - r0) * (slice + 1) / kConvSlices : r1;
         float h[3];   // x_(t-3), x_(t-2), x_(t-1)
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
-            const long long p = pos0 - 3 + i;
-            h[i] = p >= 0 ? rg[(size_t) (p % ring.slots) * ring.width + j.ch0 + c] : 0.0f;
+            const int rr = begin - 3 + i;
+            const long long p = pos0 + (rr - r0);
+            h[i] = SLICED && rr >= r0 ? conv_input<SUM>(j, eout, ew, k, rr, c) :
+                   p >= 0 ? rg[(size_t) (p % ring.slots) * ring.width + j.ch0 + c] : 0.0f;
         }
-        for (int r = r0; r < r1; ++r) {
-            float xt;
-            if constexpr (SUM) {
-                float acc = 0.0f;
-                for (int q = 0; q < k; ++q) acc = acc + eout[((size_t) r * k + q) * C + c] * ew[(size_t) r * k + q];
-                xt = acc;
-            } else {
-                xt = j.x[(size_t) r * C + c];
-            }
+        // All slices of a channel belong to this block. Read their three taps before any slice overwrites a ring cell.
+        if constexpr (SLICED) __syncthreads();
+        for (int r = begin; r < end; ++r) {
+            const float xt = conv_input<SUM>(j, eout, ew, k, r, c);
             const float xv[4] = {h[0], h[1], h[2], xt};
             float acc = 0.0f;
 #pragma unroll
@@ -272,6 +276,20 @@ __global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, Conv
             h[2] = xt;
         }
     }
+}
+
+template<bool SUM, bool RESID>
+__global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, ConvJob b, int hw, ConvRing ring, Members mem,
+                                                                 const int64_t* __restrict__ pos, const float* __restrict__ eout,
+                                                                 const float* __restrict__ ew, int k, float* cur, float* save) {
+    conv_rows_stage<SUM, RESID, false>(blockIdx.x * blockDim.x + threadIdx.x, 0, a, b, hw, ring, mem, pos, eout, ew, k, cur, save);
+}
+template<bool SUM, bool RESID>
+__global__ void __launch_bounds__(kConvChannels * kConvSlices) conv_prompt_kernel(ConvJob a, ConvJob b, int hw, ConvRing ring,
+                                                                                 Members mem, const int64_t* pos, const float* eout,
+                                                                                 const float* ew, int k, float* cur, float* save) {
+    conv_rows_stage<SUM, RESID, true>(blockIdx.x * kConvChannels + threadIdx.x % kConvChannels, threadIdx.x / kConvChannels,
+                                      a, b, hw, ring, mem, pos, eout, ew, k, cur, save);
 }
 
 // ------------------------------------------------------------------------------------------ the attention's inputs
@@ -411,25 +429,31 @@ void loop_control(const CtlJob* jobs, int n, int rows, int n_embd, int rank, flo
         a, rows, n_embd, rank, g);
 }
 
+template<bool SUM, bool RESID>
+static void launch_conv(const ConvJob& a, const ConvJob& b, int hw, const ConvRing& ring, const Members& m, const int64_t* pos,
+                        const float* eout, const float* ew, int k, float* cur, float* save, cudaStream_t stream) {
+    const int C = a.C + b.C;
+    if (m.n == 1 && m.rows() > kMaxMembers)
+        conv_prompt_kernel<SUM, RESID><<<(C + kConvChannels - 1) / kConvChannels, kConvChannels * kConvSlices, 0, stream>>>(
+            a, b, hw, ring, m, pos, eout, ew, k, cur, save);
+    else
+        conv_rows_kernel<SUM, RESID><<<(C + kConvThreads - 1) / kConvThreads, kConvThreads, 0, stream>>>(
+            a, b, hw, ring, m, pos, eout, ew, k, cur, save);
+}
+
 void conv_rows(const ConvJob& a, const ConvJob* b, int head_width, const ConvRing& ring, const Members& m, const int64_t* pos,
                void* stream) {
     if (m.rows() <= 0) return;
     const ConvJob none;
-    const int C = a.C + (b ? b->C : 0);
-    conv_rows_kernel<false, false><<<(unsigned) ((C + kConvThreads - 1) / kConvThreads), kConvThreads, 0, (cudaStream_t) stream>>>(
-        a, b ? *b : none, head_width, ring, m, pos, nullptr, nullptr, 0, nullptr, nullptr);
+    launch_conv<false, false>(a, b ? *b : none, head_width, ring, m, pos, nullptr, nullptr, 0, nullptr, nullptr, (cudaStream_t) stream);
 }
 
 void conv_residual(const ConvJob& a, const float* eout, const float* ew, int k, int head_width, const ConvRing& ring,
                    const Members& m, const int64_t* pos, float* cur, float* save, void* stream) {
     if (m.rows() <= 0) return;
     const ConvJob none;
-    const dim3 grid((unsigned) ((a.C + kConvThreads - 1) / kConvThreads));
-    cudaStream_t st = (cudaStream_t) stream;
-    if (eout)
-        conv_rows_kernel<true, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, m, pos, eout, ew, k, cur, save);
-    else
-        conv_rows_kernel<false, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, m, pos, nullptr, nullptr, 0, cur, save);
+    if (eout) launch_conv<true, true>(a, none, head_width, ring, m, pos, eout, ew, k, cur, save, (cudaStream_t) stream);
+    else launch_conv<false, true>(a, none, head_width, ring, m, pos, nullptr, nullptr, 0, cur, save, (cudaStream_t) stream);
 }
 
 void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* q_scale, const float* r_scale, const PrepArgs& a,

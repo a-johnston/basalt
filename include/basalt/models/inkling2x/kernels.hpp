@@ -64,8 +64,7 @@ struct ConvRing {
 /// + sum_lag dyn[t][h(c) 4 + lag] x_(t-lag)) * scale, h(c) = c / head_width. Inputs before a member's first row come from
 /// its ring's channels [ch0, ch0 + C) (zero before position 0), and its ring keeps the inputs of its last rows (at most
 /// ring.slots - 3) at their positions. `dyn` (null: none) is [rows][C / head_width * 4]; `out` [rows][C] (null: not
-/// written). A thread takes a channel through every row in order, so its ring cells are its own and any number of rows is
-/// one launch.
+/// written). A block owns a channel's ring cells; prompt row slices take their initial taps before the block updates the ring.
 struct ConvJob {
     const float* x = nullptr;
     const float* w = nullptr;
