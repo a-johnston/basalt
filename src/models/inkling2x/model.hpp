@@ -1,5 +1,5 @@
-// src/models/inkling2x/model.hpp - a loaded Inkling 2 pack: every tensor on the main card, the routed experts of every
-// layer in one device buffer.
+// src/models/inkling2x/model.hpp - a loaded Inkling 2 pack: every tensor on the main card but the token embedding, which
+// stays in mapped host memory (a token reads one row of it), and the routed experts of every layer in one device buffer.
 #pragma once
 
 #include "basalt/kernels/exl3_kernels.hpp"
@@ -14,7 +14,8 @@
 namespace basalt::models::inkling2x {
 
 struct DevTensor {
-    void* ptr = nullptr;
+    void* ptr = nullptr;   ///< an address the card reads: device memory, or mapped host memory when `host`
+    bool host = false;
     int type = 0;
     uint64_t bytes = 0;
     std::vector<uint64_t> shape;

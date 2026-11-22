@@ -1,5 +1,5 @@
-// src/models/inkling2x/model.cpp - loads an Inkling 2 pack: every tensor to the main card, the routed experts of every layer
-// in one device buffer.
+// src/models/inkling2x/model.cpp - loads an Inkling 2 pack: every tensor to the main card but the token embedding, the routed
+// experts of every layer in one device buffer.
 #include "models/inkling2x/model.hpp"
 
 #include "basalt/core/loader.hpp"
@@ -18,7 +18,7 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 
 Inkling2Model::~Inkling2Model() {
     for (auto& [name, t] : dev_)
-        if (t.ptr) cudaFree(t.ptr);
+        if (t.ptr) t.host ? cudaFreeHost(t.ptr) : cudaFree(t.ptr);
     if (experts_) cudaFree(experts_);
     if (d_ptr_) cudaFree(d_ptr_);
     if (d_rates_) cudaFree(d_rates_);
@@ -78,23 +78,36 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     if (fd_ < 0) return {model::Status::Error, "inkling2x: cannot open " + path};
     const int file = reads.file_fd(fd_);
     uint64_t dense = 0;
+    uint64_t embed = 0;
     for (const auto& [name, t] : pack_.tensors) {
         DevTensor d;
         d.type = t.type;
         d.bytes = t.bytes;
         d.shape = t.shape;
-        if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) {
-            cudaGetLastError();
-            return {model::Status::Error, "inkling2x: out of device memory loading " + name};
-        }
         core::LoadItem it;
         it.file = file;
         it.off = t.offset;
         it.bytes = t.bytes;
-        it.dev = d.ptr;
-        it.device = device_;
+        // the token embedding in mapped host memory: a decode token reads one row (4.6 KB of BF16), a prompt chunk one a token,
+        // and the card keeps the 0.4-0.9 GiB it would take
+        d.host = name == "token_embd.weight";
+        if (d.host) {
+            if (cudaHostAlloc(&d.ptr, d.bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                return {model::Status::Error, "inkling2x: no page-locked host memory for the token embedding"};
+            }
+            it.host = (uint8_t*) d.ptr;
+            embed += d.bytes;
+        } else {
+            if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) {
+                cudaGetLastError();
+                return {model::Status::Error, "inkling2x: out of device memory loading " + name};
+            }
+            it.dev = d.ptr;
+            it.device = device_;
+            dense += d.bytes;
+        }
         reads.add(it);
-        dense += d.bytes;
         dev_.emplace(name, std::move(d));
     }
     const uint64_t eb = pack_.experts_range.bytes;
@@ -128,8 +141,8 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     }
     ctx_ = req.max_context > 0 ? req.max_context : kDefaultContext;
     if (g.context_length > 0) ctx_ = std::min<int64_t>(ctx_, g.context_length);
-    basalt::log::info("basalt inkling2x", "%zu tensors %.2f GiB and the routed experts %.2f GiB on the GPU; context %lld", dev_.size(),
-                      (double) dense / kGiB, (double) eb / kGiB, (long long) ctx_);
+    basalt::log::info("basalt inkling2x", "%zu tensors %.2f GiB and the routed experts %.2f GiB on the GPU, the token embedding %.2f GiB in "
+                      "host memory; context %lld", dev_.size(), (double) dense / kGiB, (double) eb / kGiB, (double) embed / kGiB, (long long) ctx_);
     return {};
 }
 
