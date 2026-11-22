@@ -105,6 +105,10 @@ struct CommonOptions {
     /// that take --suffix-draft; 0 = the drafter only.
     int suffix_draft = 3;
     std::string spec_oracle;
+    /// --mtp-window N: the drafter attends to the last N cells (0 = every cell); a model that takes it may set its own
+    /// default when the flag is not given.
+    int64_t mtp_window = 32768;
+    bool mtp_window_given = false;
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)
     bool diag_teacher = false;         ///< --diag-teacher: --spec-oracle's tokens go on whatever the picks

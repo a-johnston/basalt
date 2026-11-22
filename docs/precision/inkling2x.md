@@ -92,6 +92,19 @@ sets acceptance only:
   accepted drafts were the same on the fixtures at windows of 4, within 0.6% at 8).
 - **Arithmetic:** fp32 throughout, where vLLM rounds its block's activations and the Markov head's state to BF16; the target's
   features are BF16 as in vLLM; K and V in fp16 caches.
+- **Window:** where the caches of its full-attention layer do not fit at the context asked (the 2.92 bpw pack at 128K on a 16
+  GB card), that layer keeps a ring of the last positions that do (`mtp-window`), as its local layers keep their 1,024. Keys a
+  rewind left stale are skipped, not read. Below the window the drafts are the same bits; past it a reply that draws on text
+  older than the window loses acceptance. With the 2.26 bpw pack at 128K (every position fits), 512 greedy tokens, 8-row
+  windows, no prompt lookup, tokens a window:
+
+  | Prompt | Every position | Last 32K | Last 8K | Last 2K |
+  |---|---|---|---|---|
+  | 100K tokens of C++, explain its first file | 4.87 | 2.99 | 3.01 | 2.97 |
+  | 100K tokens of C++, rewrite its first file | 5.16 | 2.57 | 2.59 | 2.50 |
+  | 40K tokens of C++, explain its first file | 5.39 | 3.37 | 3.01 | 2.95 |
+
+  The text was the same at every window.
 - **Checks:** run on the engine's own features, a double-precision reference of vLLM's formulas gives the same seven drafts in
   every block tested (hidden states within 7e-3 relative). Kernel parity against double (`inkling2x_dspark_parity`): the fp32
   stages within 3e-5 relative (the queries' RoPE, from fp32 angles as vLLM's table) and most within 3e-7, the fp16 caches within

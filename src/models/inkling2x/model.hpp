@@ -43,6 +43,10 @@ public:
     const ::basalt::kernels::NativeExpertLayout& expert_layout(int l) const { return layouts_[l]; }
     int device() const { return device_; }
     int spec() const { return spec_; }
+    /// The positions before its block the drafter's full-attention layers attend (--mtp-window): 0 every one, -1 as many
+    /// as fit beside the VRAM a start leaves free.
+    int64_t draft_window() const { return draft_window_; }
+    int vram_reserve_mib() const { return vram_reserve_mib_; }
     /// The DSpark drafter, when the pack carries it and the start drafts (spec >= 2); null otherwise.
     const DsparkConfig* dspark() const { return dsp_on_ ? &pack_.dspark : nullptr; }
     /// A drafter tensor (`dspark.*`); null when absent.
@@ -67,8 +71,8 @@ private:
     std::vector<bool> mixed_;
     unsigned long long* d_ptr_ = nullptr;
     ::basalt::kernels::Exl3Rates* d_rates_ = nullptr;
-    int device_ = 0, spec_ = 0, fd_ = -1;
-    int64_t ctx_ = kDefaultContext;
+    int device_ = 0, spec_ = 0, fd_ = -1, vram_reserve_mib_ = 0;
+    int64_t ctx_ = kDefaultContext, draft_window_ = 0;
     std::string diag_dump_;
 };
 

@@ -20,6 +20,7 @@
 #include "basalt/models/inkling2x/dspark_kernels.hpp"
 #include "basalt/models/inkling2x/kernels.hpp"
 #include "basalt/log.hpp"
+#include "basalt/platform/system.hpp"
 #include "models/inkling2x/model.hpp"
 
 #include <cuda_runtime.h>
@@ -45,6 +46,8 @@ constexpr int kRing = 32;                      // positions a convolution ring k
 constexpr int kHead = 128;
 constexpr float kMixEps = 1e-6f;
 constexpr size_t kGraphs = 8;                  // decode graphs kept (members and split counts)
+constexpr int64_t kWindowStep = 4096;          // a drafter window that fits is a multiple of this
+constexpr int kLateMib = 64;                   // VRAM lazily loaded kernels and the graphs take after the sizing
 
 // Device memory that goes back when its owner does; zeroed when taken.
 struct Buffers {
@@ -200,24 +203,38 @@ public:
                 !mem_.take(ring_[(size_t) s], (size_t) kRing * width_, err, w))
                 return false;
         }
-        if (const DsparkConfig* c = m_.dspark()) {   // the drafter's caches: the global layers by position, the local ones rings
-            const size_t ckv = (size_t) c->n_kv * c->head_dim;
+        if (const DsparkConfig* c = m_.dspark()) {   // the drafter's caches: a local layer's a ring of its window (the full
+                                                     // layers' come last, take_full_caches)
             dkc_.assign((size_t) c->n_layers, nullptr);
             dvc_.assign((size_t) c->n_layers, nullptr);
             dcells_.assign((size_t) c->n_layers, 0);
-            for (int i = 0; i < c->n_layers; ++i) {
-                dcells_[(size_t) i] = c->local[(size_t) i] ? c->window + kChunk + c->block : ctx_;
-                if (!mem_.take(dkc_[(size_t) i], (size_t) dcells_[(size_t) i] * ckv, err, "the drafter's caches") ||
-                    !mem_.take(dvc_[(size_t) i], (size_t) dcells_[(size_t) i] * ckv, err, "the drafter's caches")) {
-                    err += "; --spec 0 runs without the drafter, a shorter --max-context with it";
-                    return false;
+            dwin_.assign((size_t) c->n_layers, 0);
+            for (int i = 0; i < c->n_layers; ++i)
+                if (c->local[(size_t) i]) {
+                    dwin_[(size_t) i] = c->window;
+                    dcells_[(size_t) i] = c->window + kChunk + c->block;
+                    if (!take_draft_cache(i, err)) return false;
                 }
-            }
             if (!mem_.take(feat_, (size_t) kMaxWindow * c->target_visits.size() * g_.n_embd, err, "the drafter's features")) return false;
             drafts_.assign((size_t) c->block, 0);
             dprobs_.assign((size_t) c->block, 0.0f);
         }
         return cudaDeviceSynchronize() == cudaSuccess || (err = "the session's buffers failed", false);
+    }
+
+    // The drafter's full layers' caches: by position, or with `window` (> 0) a ring of the last `window` positions when
+    // that is the smaller.
+    bool take_full_caches(int64_t window, std::string& err) {
+        const DsparkConfig* c = m_.dspark();
+        if (window > 0 && window + kChunk + c->block < ctx_) ring_cells_ = window + kChunk + c->block;
+        for (int i = 0; i < c->n_layers; ++i)
+            if (!c->local[(size_t) i]) {
+                dwin_[(size_t) i] = window;
+                dcells_[(size_t) i] = ring_cells_ > 0 ? ring_cells_ : ctx_;
+                if (!take_draft_cache(i, err)) return false;
+            }
+        return (ring_cells_ == 0 || mem_.take(dfloor_, 1, err, "the drafter's caches")) &&
+               (cudaDeviceSynchronize() == cudaSuccess || (err = "the drafter's caches failed", false));
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
@@ -641,6 +658,13 @@ private:
             if (c->target_visits[(size_t) f] == visit) ik::features_store(x, run.m, run.feat, nf, f, g_.n_embd, stream_);
     }
 
+    bool take_draft_cache(int i, std::string& err) {
+        const size_t n = (size_t) dcells_[(size_t) i] * m_.dspark()->n_kv * m_.dspark()->head_dim;
+        if (mem_.take(dkc_[(size_t) i], n, err, "the drafter's caches") && mem_.take(dvc_[(size_t) i], n, err, "the drafter's caches")) return true;
+        err += "; --spec 0 runs without the drafter, a shorter --max-context or --mtp-window with it";
+        return false;
+    }
+
     size_t draft_kv_bytes(size_t i) const {
         const DsparkConfig* c = m_.dspark();
         return (size_t) dcells_[i] * c->n_kv * c->head_dim * 2;
@@ -653,6 +677,7 @@ private:
         Scratch& x = *x_;
         const int E = g_.n_embd, nf = (int) c->target_visits.size(), nkv = c->n_kv * c->head_dim;
         if (rows <= 0) return;
+        wrote(pos0, pos0 + rows);
         ik::Mixes mx;
         mx.n = c->n_layers;
         for (int i = 0; i < c->n_layers; ++i) {
@@ -685,6 +710,14 @@ private:
         ctx_upto_ = std::max(ctx_upto_, to);
     }
 
+    // The drafter's caches take positions [a, b). A full layer's ring then holds every position from floor_ to b: below
+    // floor_ its cells were overwritten by later positions, or by those of a timeline a rewind left (positions from hw_ on).
+    void wrote(int64_t a, int64_t b) {
+        if (ring_cells_ == 0) return;
+        floor_ = a > hw_ ? a : std::min(a, std::max(floor_, hw_ - ring_cells_));
+        hw_ = b;
+    }
+
     // The drafter's block after `anchor` at `pos`: the Markov head's context from feature row `row` of the last window, the
     // block forward and `steps` Markov steps as a graph (recorded for this session, the steps and the attention's split
     // counts), the drafts and their probabilities to the host.
@@ -693,6 +726,11 @@ private:
         Scratch& x = *x_;
         const int B = c->block, nf = (int) c->target_visits.size();
         cudaMemcpyAsync(x.anchor, &anchor, 4, cudaMemcpyHostToDevice, stream_);
+        wrote(pos, pos + B);
+        if (ring_cells_ > 0 && floor_ != floor_sent_) {   // the block's full attention skips the keys below it
+            cudaMemcpyAsync(dfloor_, &floor_, 8, cudaMemcpyHostToDevice, stream_);
+            floor_sent_ = floor_;
+        }
         ik::Members one;
         one.start[1] = B;
         ik::set_positions(x.rope_pos, one, &pos, stream_);
@@ -746,8 +784,9 @@ private:
         aa.n_kv = c->n_kv;
         aa.d_rel = 0;
         aa.extent = 0;
-        aa.window = c->local[(size_t) i] ? c->window + c->block : 0;   // the window before the block, and the block
+        aa.window = dwin_[(size_t) i] > 0 ? dwin_[(size_t) i] + c->block : 0;   // the window before the block, and the block
         aa.cells = dcells_[(size_t) i];
+        aa.floor = !c->local[(size_t) i] && ring_cells_ > 0 ? dfloor_ : nullptr;
         aa.sink_logit = false;
         return aa;
     }
@@ -971,7 +1010,11 @@ private:
     std::vector<int32_t> picks_;
     // the drafter's: its caches per layer, the last window's features, what its context holds, the last block's drafts
     std::vector<uint16_t*> dkc_, dvc_;
-    std::vector<int64_t> dcells_;
+    std::vector<int64_t> dcells_, dwin_;
+    // a full layer's ring when it keeps a window: its cells (0: by position), the first position it holds (on the card
+    // too), one past the last written
+    int64_t ring_cells_ = 0, floor_ = 0, floor_sent_ = 0, hw_ = 0;
+    int64_t* dfloor_ = nullptr;
     uint16_t* feat_ = nullptr;
     int64_t win_pos_ = -1, ctx_upto_ = 0;
     int win_rows_ = 0, n_drafts_ = 0;
@@ -985,11 +1028,44 @@ model::Result make_sessions(Inkling2Model& model, int n, std::vector<std::unique
     std::string err;
     auto x = std::make_shared<Scratch>();
     if (!x->init(model, err)) return {model::Status::Error, "inkling2x: " + err};
+    std::vector<Session*> made;
     for (int i = 0; i < n; ++i) {
         auto s = std::make_unique<Session>(model, x);
         if (!s->init(err)) return {model::Status::Error, "inkling2x: " + err};
+        made.push_back(s.get());
         sessions.push_back(std::move(s));
     }
+    const DsparkConfig* c = model.dspark();
+    if (!c) return {};
+    // The drafter's full layers attend every position when each session's caches for them fit beside what is allocated
+    // later (lazily loaded kernels and graphs; the copy of one session's running state a server snapshots checkpoints
+    // into) and the VRAM a start leaves free, else the longest window (a multiple of kWindowStep) that does;
+    // --mtp-window sets it.
+    int64_t window = model.draft_window();
+    const char* why = "--mtp-window";
+    if (window < 0) {
+        int full = 0;
+        for (int i = 0; i < c->n_layers; ++i) full += !c->local[(size_t) i];
+        const uint64_t cell = (uint64_t) full * 2 * c->n_kv * c->head_dim * 2;   // fp16 K and V a position
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const uint64_t keep = ((uint64_t) std::max(model.vram_reserve_mib(), platform::vram_floor_mib() + kLateMib) << 20) +
+                              made[0]->running_bytes();
+        const uint64_t room = free_b > keep ? (free_b - keep) / (uint64_t) n : 0;
+        if (room >= cell * (uint64_t) model.context()) {
+            window = 0;
+        } else {
+            window = ((int64_t) (room / cell) - kChunk - c->block) / kWindowStep * kWindowStep;
+            if (window < kWindowStep)
+                return {model::Status::Error, "inkling2x: out of device memory for the drafter's caches; --spec 0 runs without the "
+                                              "drafter, a shorter --max-context with it"};
+            why = "what fits";
+        }
+    }
+    for (Session* s : made)
+        if (!s->take_full_caches(window, err)) return {model::Status::Error, "inkling2x: " + err};
+    if (window > 0)
+        basalt::log::info("basalt inkling2x", "the drafter's full attention: the last %lld positions (%s)", (long long) window, why);
     return {};
 }
 

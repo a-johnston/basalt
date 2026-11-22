@@ -54,6 +54,9 @@ public:
             o.spec_given = true;
         } else if (a == "--suffix-draft") {
             o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
+        } else if (a == "--mtp-window") {
+            o.mtp_window = std::max(0LL, std::atoll(args.next("--mtp-window")));
+            o.mtp_window_given = true;
         } else {
             return false;
         }

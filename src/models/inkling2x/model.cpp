@@ -181,6 +181,8 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     }
     ctx_ = req.max_context > 0 ? req.max_context : kDefaultContext;
     if (g.context_length > 0) ctx_ = std::min<int64_t>(ctx_, g.context_length);
+    draft_window_ = req.draft_window >= ctx_ ? 0 : req.draft_window;
+    vram_reserve_mib_ = req.vram_reserve_mib;
     basalt::log::info("basalt inkling2x", "%zu tensors %.2f GiB and the routed experts %.2f GiB on the GPU, the token embedding %.2f GiB in "
                       "host memory; context %lld", dev_.size(), (double) dense / kGiB, (double) eb / kGiB, (double) embed / kGiB, (long long) ctx_);
     if (dsp_on_)
