@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace basalt::models::inkling2x {
 namespace {
@@ -17,8 +18,9 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 }
 
 Inkling2Model::~Inkling2Model() {
-    for (auto& [name, t] : dev_)
-        if (t.ptr) t.host ? cudaFreeHost(t.ptr) : cudaFree(t.ptr);
+    for (auto* m : {&dev_, &dsp_})
+        for (auto& [name, t] : *m)
+            if (t.ptr) t.host ? cudaFreeHost(t.ptr) : cudaFree(t.ptr);
     if (experts_) cudaFree(experts_);
     if (d_ptr_) cudaFree(d_ptr_);
     if (d_rates_) cudaFree(d_rates_);
@@ -28,6 +30,11 @@ Inkling2Model::~Inkling2Model() {
 const DevTensor* Inkling2Model::tensor(const std::string& name) const {
     auto it = dev_.find(name);
     return it == dev_.end() ? nullptr : &it->second;
+}
+
+const DevTensor* Inkling2Model::dtensor(const std::string& name) const {
+    auto it = dsp_.find(name);
+    return it == dsp_.end() ? nullptr : &it->second;
 }
 
 model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan& reads, std::vector<std::unique_ptr<model::ModelSession>>&) {
@@ -110,6 +117,36 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
         reads.add(it);
         dev_.emplace(name, std::move(d));
     }
+    // the drafter: on the card but its Markov token table, which a step reads one row of (mapped host memory)
+    uint64_t draft_dev = 0, draft_host = 0;
+    dsp_on_ = pack_.has_dspark && spec_ >= 2;
+    if (dsp_on_)
+        for (const auto& [name, t] : pack_.dspark_tensors) {
+            DevTensor d;
+            d.type = t.type;
+            d.bytes = t.bytes;
+            d.shape = t.shape;
+            core::LoadItem it;
+            it.file = file;
+            it.off = t.offset;
+            it.bytes = t.bytes;
+            d.host = name == "dspark.markov_token_embd";
+            if (d.host ? cudaHostAlloc(&d.ptr, d.bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess
+                       : cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) {
+                cudaGetLastError();
+                return {model::Status::Error, "inkling2x: out of memory loading the drafter's " + name};
+            }
+            if (d.host) {
+                it.host = (uint8_t*) d.ptr;
+                draft_host += d.bytes;
+            } else {
+                it.dev = d.ptr;
+                it.device = device_;
+                draft_dev += d.bytes;
+            }
+            reads.add(it);
+            dsp_.emplace(name, std::move(d));
+        }
     const uint64_t eb = pack_.experts_range.bytes;
     if (cudaMalloc(&experts_, eb) != cudaSuccess) {
         cudaGetLastError();
@@ -143,10 +180,29 @@ model::Result Inkling2Model::plan(const model::LoadRequest& req, core::LoadPlan&
     if (g.context_length > 0) ctx_ = std::min<int64_t>(ctx_, g.context_length);
     basalt::log::info("basalt inkling2x", "%zu tensors %.2f GiB and the routed experts %.2f GiB on the GPU, the token embedding %.2f GiB in "
                       "host memory; context %lld", dev_.size(), (double) dense / kGiB, (double) eb / kGiB, (double) embed / kGiB, (long long) ctx_);
+    if (dsp_on_)
+        basalt::log::info("basalt inkling2x", "the DSpark drafter: %zu tensors %.2f GiB on the GPU, its Markov token table %.2f GiB in host memory; "
+                          "blocks of %d", dsp_.size(), (double) draft_dev / kGiB, (double) draft_host / kGiB, pack_.dspark.block);
+    else if (pack_.has_dspark)
+        basalt::log::info("basalt inkling2x", "the pack's DSpark drafter is off (--spec %d)", spec_);
     return {};
 }
 
 model::Result Inkling2Model::attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) {
+    if (dsp_on_) {   // the feature mixes' weights: softmax over the features, per row
+        const DevTensor* f = dtensor("dspark.fuse");
+        const int nf = (int) pack_.dspark.target_visits.size(), rows = pack_.dspark.n_layers + 1;
+        if (!f || f->bytes != (uint64_t) rows * nf * 4) return {model::Status::Error, "inkling2x: the drafter's dspark.fuse is not [features, layers + 1]"};
+        std::vector<float> w((size_t) rows * nf);
+        if (cudaMemcpy(w.data(), f->ptr, f->bytes, cudaMemcpyDeviceToHost) != cudaSuccess) return {model::Status::Error, "inkling2x: reading dspark.fuse"};
+        fuse_alpha_.assign(w.size(), 0.0f);
+        for (int r = 0; r < rows; ++r) {
+            float mx = -INFINITY, sum = 0.0f;
+            for (int j = 0; j < nf; ++j) mx = std::max(mx, w[(size_t) r * nf + j]);
+            for (int j = 0; j < nf; ++j) sum += std::exp(w[(size_t) r * nf + j] - mx);
+            for (int j = 0; j < nf; ++j) fuse_alpha_[(size_t) r * nf + j] = std::exp(w[(size_t) r * nf + j] - mx) / sum;
+        }
+    }
     return make_sessions(*this, std::max(req.sessions, 1), sessions);
 }
 

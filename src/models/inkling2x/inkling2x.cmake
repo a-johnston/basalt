@@ -1,5 +1,6 @@
 # Inkling 2 Mini from GGUF and EXL3 packs (inkling2x): its kernels, the model, its tests.
-add_library(inkling2x_kernels STATIC src/models/inkling2x/kernels/ops.cu src/models/inkling2x/kernels/attention.cu)
+add_library(inkling2x_kernels STATIC src/models/inkling2x/kernels/ops.cu src/models/inkling2x/kernels/attention.cu
+            src/models/inkling2x/kernels/dspark.cu)
 target_include_directories(inkling2x_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(inkling2x_kernels PUBLIC ${_gpu_runtime_target})
 add_library(model_inkling2x STATIC src/models/inkling2x/adapter.cpp src/models/inkling2x/pretok_o200k.cpp src/models/inkling2x/pack.cpp
@@ -12,6 +13,11 @@ if(BUILD_TESTING)
   target_include_directories(inkling2x_kernels_parity PRIVATE ${_gpu_include_directories})
   target_link_libraries(inkling2x_kernels_parity PRIVATE inkling2x_kernels kernels kernels_cpu ${_gpu_runtime_target})
   basalt_gpu_test(NAME inkling2x_kernels_parity COMMAND inkling2x_kernels_parity)
+
+  add_executable(inkling2x_dspark_parity src/models/inkling2x/dspark_parity.cpp)
+  target_include_directories(inkling2x_dspark_parity PRIVATE ${_gpu_include_directories})
+  target_link_libraries(inkling2x_dspark_parity PRIVATE inkling2x_kernels kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME inkling2x_dspark_parity COMMAND inkling2x_dspark_parity)
   add_executable(inkling2x_pretok_test src/models/inkling2x/pretok_test.cpp src/models/inkling2x/pretok_o200k.cpp)
   target_include_directories(inkling2x_pretok_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
   target_link_libraries(inkling2x_pretok_test PRIVATE tokenizer)

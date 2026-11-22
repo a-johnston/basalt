@@ -16,6 +16,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/models/inkling2x/dspark_kernels.hpp"
 #include "basalt/models/inkling2x/kernels.hpp"
 #include "basalt/log.hpp"
 #include "models/inkling2x/model.hpp"
@@ -78,12 +79,19 @@ struct Scratch {
     unsigned long long* grp_ptr = nullptr;
     bk::Exl3Rates* grp_rates = nullptr;
     std::vector<float*> blk;   // per layer slot where a block starts: the stream before it
+    // the drafter's (when it runs): a prompt chunk's features, its block's rows, its Markov head, its picks
+    uint16_t* feat = nullptr;
+    int64_t *rope_pos = nullptr, *attn_pos = nullptr;
+    float *dres = nullptr, *dx = nullptr, *dh = nullptr, *dadd = nullptr, *dq = nullptr, *frnn = nullptr, *mctx = nullptr, *mraw = nullptr,
+          *mstate = nullptr, *mlatent = nullptr, *memb = nullptr, *mpick = nullptr, *probs = nullptr;
+    uint8_t *dxq = nullptr, *dhq = nullptr;
+    int32_t *anchor = nullptr, *tokens = nullptr, *prev = nullptr;
     struct Graph {
         std::vector<uintptr_t> key;
         core::CapturedGraph g;
         uint64_t used = 0;
     };
-    std::vector<Graph> graphs;
+    std::vector<Graph> graphs, dgraphs;   // the decode windows', the drafter's blocks'
     uint64_t tick = 0;
 
     bool init(Inkling2Model& m, std::string& err) {
@@ -116,6 +124,25 @@ struct Scratch {
         blk.assign((size_t) g.slots(), nullptr);
         for (int s = 0; s < g.slots(); ++s)
             if (g.layer_of(s) % g.block == 0 && !mem.take(blk[(size_t) s], RE, err, w)) return false;
+        if (const DsparkConfig* c = m.dspark()) {
+            const size_t B = (size_t) c->block, F = c->target_visits.size(), r3 = 3 * (size_t) c->rank;
+            const int nqd = c->n_head * c->head_dim;
+            ok = mem.take(feat, (size_t) R * F * E, err, w) && mem.take(rope_pos, B, err, w) && mem.take(attn_pos, B, err, w) &&
+                 mem.take(dres, B * E, err, w) && mem.take(dx, B * E, err, w) && mem.take(dh, B * E, err, w) && mem.take(dadd, B * E, err, w) &&
+                 mem.take(dq, B * nqd, err, w) && mem.take(frnn, (size_t) E, err, w) && mem.take(mctx, B * r3, err, w) &&
+                 mem.take(mraw, r3, err, w) && mem.take(mstate, (size_t) c->rank, err, w) && mem.take(mlatent, (size_t) c->rank, err, w) &&
+                 mem.take(memb, (size_t) c->rank, err, w) && mem.take(mpick, ik::markov_pick_scratch_floats(g.n_vocab), err, w) &&
+                 mem.take(probs, B, err, w) && mem.take(dxq, B * std::max(q8, (size_t) c->n_ff / 32 * 36), err, w) &&
+                 mem.take(dhq, B * std::max(q8, (size_t) c->n_ff / 32 * 36), err, w) && mem.take(anchor, 1, err, w) && mem.take(tokens, B, err, w) &&
+                 mem.take(prev, 1, err, w);
+            if (!ok) return false;
+            // the block's gate and up rows go to eout ([R][K][E]): enough for two of [block][n_ff]; its keys, values, attention
+            // and workspace take the target's
+            if (2 * B * (size_t) c->n_ff > (size_t) R * K * E || B > (size_t) kMaxWindow || c->n_head > g.n_head || c->n_kv > g.n_kv) {
+                err = "the drafter's block does not fit the forward's scratch";
+                return false;
+            }
+        }
         return cudaDeviceSynchronize() == cudaSuccess || (err = "the forward's scratch failed", false);
     }
 };
@@ -126,6 +153,7 @@ class Session;
 // last rows get logits (none in a prompt chunk).
 struct Run {
     ik::Members m;
+    ik::FeatureDst feat;   // where each member's rows of target features go (the drafter's; none: p[0] null)
     Session* s[kMaxWindow] = {};
     int64_t first[kMaxWindow] = {};
     int head[kMaxWindow] = {};
@@ -166,6 +194,23 @@ public:
                 !mem_.take(ring_[(size_t) s], (size_t) kRing * width_, err, w))
                 return false;
         }
+        if (const DsparkConfig* c = m_.dspark()) {   // the drafter's caches: the global layers by position, the local ones rings
+            const size_t ckv = (size_t) c->n_kv * c->head_dim;
+            dkc_.assign((size_t) c->n_layers, nullptr);
+            dvc_.assign((size_t) c->n_layers, nullptr);
+            dcells_.assign((size_t) c->n_layers, 0);
+            for (int i = 0; i < c->n_layers; ++i) {
+                dcells_[(size_t) i] = c->local[(size_t) i] ? c->window + kChunk + c->block : ctx_;
+                if (!mem_.take(dkc_[(size_t) i], (size_t) dcells_[(size_t) i] * ckv, err, "the drafter's caches") ||
+                    !mem_.take(dvc_[(size_t) i], (size_t) dcells_[(size_t) i] * ckv, err, "the drafter's caches")) {
+                    err += "; --spec 0 runs without the drafter, a shorter --max-context with it";
+                    return false;
+                }
+            }
+            if (!mem_.take(feat_, (size_t) kMaxWindow * c->target_visits.size() * g_.n_embd, err, "the drafter's features")) return false;
+            drafts_.assign((size_t) c->block, 0);
+            dprobs_.assign((size_t) c->block, 0.0f);
+        }
         return cudaDeviceSynchronize() == cudaSuccess || (err = "the session's buffers failed", false);
     }
 
@@ -175,6 +220,37 @@ public:
     }
 
     int batch_rows() const override { return kMaxWindow; }
+
+    // a window: the anchor and up to block - 1 drafts while the drafter runs
+    int max_window() const override {
+        const DsparkConfig* c = m_.dspark();
+        return c ? std::max(1, std::min(m_.spec(), c->block)) : 1;
+    }
+
+    // ---- drafting: the rows of the last window before `pos` were accepted, so their features become the drafter's context;
+    // then its block after `anchor` (the token at `pos`), run to the end here (it shares the forward's scratch)
+    model::Result draft_begin(int32_t anchor, int64_t pos, int n) override {
+        const DsparkConfig* c = m_.dspark();
+        if (!c) return {model::Status::NotImplemented, "inkling2x: no drafter"};
+        n_drafts_ = 0;
+        commit_pending(pos);
+        const int64_t row = pos - 1 - win_pos_;   // the last accepted row: the Markov head's context
+        if (n < 1 || win_pos_ < 0 || row < 0 || row >= win_rows_ || pos + c->block > ctx_) return {};
+        std::string err;
+        n = std::min(n, c->block - 1);
+        if (!draft_block(anchor, pos, (int) row, n, err)) return {model::Status::Error, "inkling2x: the drafter: " + err};
+        n_drafts_ = n;
+        return {};
+    }
+
+    model::Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
+        n = std::min(max_n, n_drafts_);
+        for (int i = 0; i < n; ++i) {
+            ids[i] = drafts_[(size_t) i];
+            conf[i] = dprobs_[(size_t) i];
+        }
+        return {};
+    }
 
     model::Result decode_batch(model::ModelSession* const* sessions, const model::DecodeRequest* reqs, int n) override {
         if (n < 1 || n > kMaxWindow) return {model::Status::Error, "inkling2x: a batch of " + std::to_string(n) + " windows"};
@@ -193,6 +269,11 @@ public:
             tokens.insert(tokens.end(), r.tokens, r.tokens + r.n_tokens);
         }
         std::string err;
+        if (m_.dspark())
+            for (int i = 0; i < n; ++i) {   // a member's accepted rows of its last window, before this one's features take their place
+                run.s[i]->commit_pending(reqs[i].pos);
+                run.feat.p[i] = run.s[i]->feat_;
+            }
         if (!run_rows(run, tokens.data(), true, err)) return {model::Status::Error, "inkling2x: " + err};
         // each member's draw from its own logits, then one wait
         for (int i = 0; i < n; ++i) run.s[i]->draw(reqs[i], run.head[i], stream_);
@@ -206,6 +287,8 @@ public:
             if (r.logits) cudaMemcpy(r.logits, s.logits_ + (size_t) (run.head[i] - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost);
             s.last_rows_ = run.head[i];
             s.pos_ = r.pos + r.n_tokens;
+            s.win_pos_ = r.pos;
+            s.win_rows_ = r.n_tokens;
         }
         return {};
     }
@@ -220,7 +303,14 @@ public:
             run.m.start[1] = std::min(kChunk, r.n_tokens - t0);
             run.s[0] = this;
             run.first[0] = r.pos + t0;
+            if (m_.dspark()) run.feat.p[0] = x_->feat;
             if (!run_rows(run, r.tokens + t0, false, err)) return {model::Status::Error, "inkling2x: " + err};
+            if (m_.dspark()) {   // a prompt's rows are all kept: their features become the drafter's context now
+                commit(x_->feat, run.rows(), r.pos + t0);
+                ctx_upto_ = r.pos + t0 + run.rows();
+                win_pos_ = -1;
+                win_rows_ = 0;
+            }
             pos_ = r.pos + t0 + run.rows();
             if (r.progress) {
                 cudaStreamSynchronize(stream_);
@@ -269,6 +359,8 @@ public:
     size_t running_bytes() const override {
         size_t n = 0;
         for (int s = 0; s < g_.slots(); ++s) n += (size_t) kRing * width_ * 4 + (g_.swa[(size_t) g_.layer_of(s)] ? 2 * kv_bytes_of(s) : 0);
+        for (size_t i = 0; i < dkc_.size(); ++i)
+            if (m_.dspark()->local[i]) n += 2 * draft_kv_bytes(i);
         return n;
     }
 
@@ -283,12 +375,20 @@ public:
                 st.regions.push_back({vc_[(size_t) s], kv_bytes_of(s)});
             }
         }
+        for (size_t i = 0; i < dkc_.size(); ++i)
+            if (m_.dspark()->local[i]) {
+                st.regions.push_back({dkc_[i], draft_kv_bytes(i)});
+                st.regions.push_back({dvc_[i], draft_kv_bytes(i)});
+            }
         st.stream = stream_;
         return {};
     }
 
     model::Result running_restored(int64_t pos, const uint8_t*) override {
         pos_ = pos;
+        ctx_upto_ = pos;   // the drafter's context runs to the checkpoint; no window's features wait
+        win_pos_ = -1;
+        win_rows_ = 0;
         return {};
     }
 
@@ -512,6 +612,192 @@ private:
         if (diag()) dump("l_out-" + std::to_string(s), x.cur, (int64_t) RE);
     }
 
+    // feature f of every row: the input partial block of the target visit the drafter reads, or the final-norm output
+    void capture(const Run& run, int visit, const float* x) {
+        const DsparkConfig* c = m_.dspark();
+        if (!c || !run.feat.p[0]) return;
+        const int nf = (int) c->target_visits.size();
+        for (int f = 0; f < nf; ++f)
+            if (c->target_visits[(size_t) f] == visit) ik::features_store(x, run.m, run.feat, nf, f, g_.n_embd, stream_);
+    }
+
+    size_t draft_kv_bytes(size_t i) const {
+        const DsparkConfig* c = m_.dspark();
+        return (size_t) dcells_[i] * c->n_kv * c->head_dim * 2;
+    }
+
+    // `rows` rows of features (positions pos0..) into the drafter's context: each layer's mix, its context projections,
+    // the key norm and RoPE, both to the layer's cache
+    void commit(const uint16_t* feat, int rows, int64_t pos0) {
+        const DsparkConfig* c = m_.dspark();
+        Scratch& x = *x_;
+        const int E = g_.n_embd, nf = (int) c->target_visits.size(), nkv = c->n_kv * c->head_dim;
+        if (rows <= 0) return;
+        ik::Mixes mx;
+        mx.n = c->n_layers;
+        for (int i = 0; i < c->n_layers; ++i) {
+            for (int f = 0; f < nf; ++f) mx.alpha[i][f] = m_.fuse_alpha()[(size_t) i * nf + f];
+            mx.w[i] = (const float*) m_.dtensor(i, "feature_norm.weight")->ptr;
+        }
+        ik::feature_mix(feat, rows, nf, mx, E, c->rms_eps, x.mix, x.xq, stream_);
+        ik::Members one;
+        one.start[1] = rows;
+        ik::set_positions(x.pos, one, &pos0, stream_);
+        ik::QkArgs qa;
+        qa.n_head = c->n_head;
+        qa.n_kv = c->n_kv;
+        qa.theta = c->rope_theta;
+        qa.eps = c->rms_eps;
+        for (int i = 0; i < c->n_layers; ++i) {
+            const void* xq = x.xq + (size_t) i * rows * q8(E);
+            Proj pr[2] = {{m_.dtensor(i, "attn_k_ctx.weight"), x.kraw, nkv, 0}, {m_.dtensor(i, "attn_v_ctx.weight"), x.vraw, nkv, 0}};
+            gemv_sets(pr, 2, &xq, E, rows);
+            ik::qk_norm_rope_store(nullptr, nullptr, x.kraw, (const float*) m_.dtensor(i, "attn_k_ctx_norm.weight")->ptr, x.vraw, qa, x.pos, rows,
+                                   dkc_[(size_t) i], dvc_[(size_t) i], dcells_[(size_t) i], stream_);
+        }
+    }
+
+    // the last window's rows before `upto` that are not in the drafter's context yet
+    void commit_pending(int64_t upto) {
+        if (!m_.dspark() || win_pos_ < 0) return;
+        const int64_t from = std::max(ctx_upto_, win_pos_), to = std::min(upto, win_pos_ + win_rows_);
+        if (to > from) commit(feat_ + (size_t) (from - win_pos_) * m_.dspark()->target_visits.size() * g_.n_embd, (int) (to - from), from);
+        ctx_upto_ = std::max(ctx_upto_, to);
+    }
+
+    // The drafter's block after `anchor` at `pos`: the Markov head's context from feature row `row` of the last window, the
+    // block forward and `steps` Markov steps as a graph (recorded for this session, the steps and the attention's split
+    // counts), the drafts and their probabilities to the host.
+    bool draft_block(int32_t anchor, int64_t pos, int row, int steps, std::string& err) {
+        const DsparkConfig* c = m_.dspark();
+        Scratch& x = *x_;
+        const int B = c->block, nf = (int) c->target_visits.size();
+        cudaMemcpyAsync(x.anchor, &anchor, 4, cudaMemcpyHostToDevice, stream_);
+        ik::Members one;
+        one.start[1] = B;
+        ik::set_positions(x.rope_pos, one, &pos, stream_);
+        ik::Members each;   // every block row attends the keys up to the block's last
+        each.n = B;
+        std::vector<int64_t> last((size_t) B, pos + B - 1);
+        for (int i = 0; i <= B; ++i) each.start[i] = i;
+        ik::set_positions(x.attn_pos, each, last.data(), stream_);
+        ik::Mixes mr;   // the Markov head's context: the last accepted row's features, its own mix
+        mr.n = 1;
+        for (int f = 0; f < nf; ++f) mr.alpha[0][f] = m_.fuse_alpha()[(size_t) c->n_layers * nf + f];
+        mr.w[0] = (const float*) m_.dtensor("dspark.markov_feature_norm")->ptr;
+        ik::feature_mix(feat_ + (size_t) row * nf * g_.n_embd, 1, nf, mr, g_.n_embd, c->rms_eps, x.frnn, nullptr, stream_);
+        std::vector<uintptr_t> key{(uintptr_t) this, (uintptr_t) steps};
+        for (int i = 0; i < c->n_layers; ++i) key.push_back((uintptr_t) ik::attention_splits(draft_attn_args(i), pos + B - 1, B));
+        if (diag()) {   // launches, as the forward's under --diag-dump
+            if (!draft_forward(steps, pos + B - 1, err)) return false;
+        } else {
+            auto it = std::find_if(x.dgraphs.begin(), x.dgraphs.end(), [&](const Scratch::Graph& g) { return g.key == key; });
+            if (it == x.dgraphs.end()) {
+                if (x.dgraphs.size() >= kGraphs)
+                    x.dgraphs.erase(std::min_element(x.dgraphs.begin(), x.dgraphs.end(),
+                                                     [](const Scratch::Graph& a, const Scratch::Graph& b) { return a.used < b.used; }));
+                Scratch::Graph g;
+                g.key = key;
+                if (!g.g.begin(stream_, err)) return false;
+                const bool ok = draft_forward(steps, pos + B - 1, err);
+                if (!g.g.end(stream_, err) || !ok) {
+                    err = "the draft graph: " + err;
+                    return false;
+                }
+                x.dgraphs.push_back(std::move(g));
+                it = x.dgraphs.end() - 1;
+            }
+            it->used = ++x.tick;
+            if (!it->g.launch(stream_, err)) return false;
+        }
+        cudaMemcpyAsync(drafts_.data(), x.tokens, (size_t) steps * 4, cudaMemcpyDeviceToHost, stream_);
+        cudaMemcpyAsync(dprobs_.data(), x.probs, (size_t) steps * 4, cudaMemcpyDeviceToHost, stream_);
+        if (cudaStreamSynchronize(stream_) != cudaSuccess) {
+            err = "the block failed";
+            return false;
+        }
+        return true;
+    }
+
+    ik::AttnArgs draft_attn_args(int i) const {
+        const DsparkConfig* c = m_.dspark();
+        ik::AttnArgs aa;
+        aa.n_head = c->n_head;
+        aa.n_kv = c->n_kv;
+        aa.d_rel = 0;
+        aa.extent = 0;
+        aa.window = c->local[(size_t) i] ? c->window + c->block : 0;   // the window before the block, and the block
+        aa.cells = dcells_[(size_t) i];
+        aa.sink_logit = false;
+        return aa;
+    }
+
+    // The block: the anchor's normed embedding and the mask rows, three layers (pre-norm attention over the context and the
+    // block, the gated MLP), the final norm; the target head on the mask rows; the Markov steps, each a draft.
+    // the block (every row: the mask rows see each other) and the first `steps` drafts; p_last (the block's last position)
+    // sizes the attention's grid, as the graph key's split counts
+    bool draft_forward(int steps, int64_t p_last, std::string& err) {
+        const DsparkConfig* c = m_.dspark();
+        Scratch& x = *x_;
+        const int B = c->block, E = g_.n_embd, nq = c->n_head * c->head_dim, nkv = c->n_kv * c->head_dim, rank = c->rank;
+        const float eps = c->rms_eps;
+        auto D = [&](int i, const char* s) { return m_.dtensor(i, s); };
+        auto DF = [&](int i, const char* s) { return (const float*) m_.dtensor(i, s)->ptr; };
+        auto TF = [&](const char* s) { return (const float*) m_.dtensor(s)->ptr; };
+        const DevTensor* te = m_.tensor("token_embd.weight");
+        bk::iq_embed_rows(te->type, te->ptr, bk::iq_row_bytes(te->type, E), x.anchor, 1, E, x.dx, stream_);
+        bk::rms_norm_rows(x.dx, (const float*) m_.tensor("token_embd_norm.weight")->ptr, x.dres, 1, E, g_.rms_eps, stream_);
+        ik::fill_mask_rows(x.dres, TF("dspark.mask_embd"), B, E, stream_);
+        ik::QkArgs qa;
+        qa.n_head = c->n_head;
+        qa.n_kv = c->n_kv;
+        qa.theta = c->rope_theta;
+        qa.eps = eps;
+        ik::Members one;
+        one.start[1] = B;
+        float* gate = x.eout;
+        float* up = x.eout + (size_t) B * c->n_ff;
+        for (int i = 0; i < c->n_layers; ++i) {
+            ik::add_norm_quant(x.dres, i == 0 ? nullptr : x.dadd, DF(i, "attn_norm.weight"), B, E, eps, nullptr, x.dxq, stream_);
+            const void* xq = x.dxq;
+            Proj pr[3] = {{D(i, "attn_q.weight"), x.dq, nq, 0}, {D(i, "attn_k.weight"), x.kraw, nkv, 0}, {D(i, "attn_v.weight"), x.vraw, nkv, 0}};
+            gemv_sets(pr, 3, &xq, E, B);
+            ik::qk_norm_rope_store(x.dq, DF(i, "attn_q_norm.weight"), x.kraw, DF(i, "attn_k_norm.weight"), x.vraw, qa, x.rope_pos, B,
+                                   dkc_[(size_t) i], dvc_[(size_t) i], dcells_[(size_t) i], stream_);
+            ik::KvCaches kv;
+            kv.k[0] = dkc_[(size_t) i];
+            kv.v[0] = dvc_[(size_t) i];
+            ik::attention(x.dq, nullptr, nullptr, nullptr, nullptr, kv, draft_attn_args(i), one, x.attn_pos, p_last, x.ws, x.att,
+                          x.attq, stream_);
+            gemv(D(i, "attn_output.weight"), x.attq, x.dadd, nq, E, B);
+            ik::add_norm_quant(x.dres, x.dadd, DF(i, "ffn_norm.weight"), B, E, eps, nullptr, x.dxq, stream_);
+            Proj mlp[2] = {{D(i, "ffn_gate.weight"), gate, c->n_ff, 0}, {D(i, "ffn_up.weight"), up, c->n_ff, 0}};
+            gemv_sets(mlp, 2, &xq, E, B);
+            ik::swiglu_quant(gate, up, B, c->n_ff, x.dhq, stream_);
+            gemv(D(i, "ffn_down.weight"), x.dhq, x.dadd, c->n_ff, E, B);
+        }
+        ik::add_norm_quant(x.dres, x.dadd, TF("dspark.output_norm"), B, E, eps, x.dh, x.dxq, stream_);
+        // the target head on the mask rows (their own positions' predictions), then the Markov head's steps
+        gemv(m_.tensor("output.weight"), x.dxq + q8(E), x.hl, E, g_.vocab_padded, steps);
+        const float* W = TF("dspark.markov_rnn");
+        const uint16_t* w1 = (const uint16_t*) m_.dtensor("dspark.markov_token_embd")->ptr;
+        const uint16_t* fold = (const uint16_t*) m_.dtensor("dspark.markov_fold")->ptr;
+        ik::markov_context(W, TF("dspark.markov_rnn_bias"), x.dh + E, E, x.frnn, steps, rank, E, x.mctx, stream_);
+        cudaMemsetAsync(x.mstate, 0, (size_t) rank * 4, stream_);
+        ik::markov_embed(w1, x.anchor, rank, x.memb, stream_);
+        // each step over the whole vocabulary: the Markov bias moves tokens from past the base logits' best few hundred to the top
+        for (int k = 0; k < steps; ++k) {
+            ik::markov_step(x.mctx + (size_t) k * 3 * rank, W, x.memb, rank, E, x.mraw, x.mstate, x.mlatent, stream_);
+            ik::markov_pick(x.hl + (size_t) k * g_.vocab_padded, fold, TF("dspark.markov_fold_bias"), x.mlatent, g_.n_vocab, g_.logit_cap, x.mpick,
+                            w1, x.tokens + k, x.probs + k, x.prev, x.memb, stream_);
+        }
+        if (cudaGetLastError() != cudaSuccess) {
+            err = "a kernel failed to launch";
+            return false;
+        }
+        return true;
+    }
+
     ik::AttnArgs attn_args(int s, int l) const {
         const bool swa = g_.swa[(size_t) l];
         ik::AttnArgs aa;
@@ -581,7 +867,11 @@ private:
         cudaMemcpyAsync(x.cur, x.emb, RE * 4, cudaMemcpyDeviceToDevice, stream_);
         if (diag()) dump("inp_norm", x.emb, (int64_t) RE);
         std::vector<const float*> blocks;
-        for (int l = 0; l < g_.loop_start; ++l) layer(run, l, l, blocks, nullptr);
+        int visit = 0;
+        for (int l = 0; l < g_.loop_start; ++l) {
+            capture(run, visit++, x.cur);
+            layer(run, l, l, blocks, nullptr);
+        }
         cudaMemcpyAsync(x.pre, x.cur, RE * 4, cudaMemcpyDeviceToDevice, stream_);
         const std::vector<const float*> prelude = blocks;
         std::vector<const float*> bank;
@@ -594,15 +884,26 @@ private:
             }
             for (int l = g_.loop_start; l < g_.loop_end; ++l) {
                 const int s = p == 0 ? l : g_.n_layers + (p - 1) * g_.core() + (l - g_.loop_start);
+                capture(run, visit++, x.cur);
                 layer(run, s, l, blocks, p > 0 ? &bank : nullptr);
             }
             cudaMemcpyAsync(x.out[p % 2], x.cur, RE * 4, cudaMemcpyDeviceToDevice, stream_);
         }
-        for (int l = g_.loop_end; l < g_.n_layers; ++l) layer(run, l, l, blocks, nullptr);
+        for (int l = g_.loop_end; l < g_.n_layers; ++l) {
+            capture(run, visit++, x.cur);
+            layer(run, l, l, blocks, nullptr);
+        }
+        if (!decode && run.feat.p[0]) {   // a prompt's final-norm output, a feature the drafter reads (its head is not run)
+            ik::depth_mix(states(blocks, x.cur), (const float*) m_.tensor("output_res_query.weight")->ptr, 1, R, E, kMixEps, x.fx, stream_);
+            const ik::NormJob hj{x.fx, (const float*) m_.tensor("output_norm.weight")->ptr};
+            ik::norm_quant(&hj, 1, R, E, g_.rms_eps, x.fn, nullptr, stream_);
+            capture(run, visit, x.fn);
+        }
         if (decode) {   // the output: the states mixed by its own query, normed, the head, and each member's rows capped
             ik::depth_mix(states(blocks, x.cur), (const float*) m_.tensor("output_res_query.weight")->ptr, 1, R, E, kMixEps, x.fx, stream_);
             const ik::NormJob hj{x.fx, (const float*) m_.tensor("output_norm.weight")->ptr};
             ik::norm_quant(&hj, 1, R, E, g_.rms_eps, x.hn, x.hq, stream_);
+            capture(run, visit, x.hn);
             gemv(m_.tensor("output.weight"), x.hq, x.hl, E, g_.vocab_padded, R);
             for (int i = 0; i < run.m.n; ++i) {
                 const int row = run.m.start[i + 1] - run.head[i];
@@ -646,6 +947,14 @@ private:
     std::vector<int64_t> cells_;
     std::vector<float*> ring_;
     std::vector<int32_t> picks_;
+    // the drafter's: its caches per layer, the last window's features, what its context holds, the last block's drafts
+    std::vector<uint16_t*> dkc_, dvc_;
+    std::vector<int64_t> dcells_;
+    uint16_t* feat_ = nullptr;
+    int64_t win_pos_ = -1, ctx_upto_ = 0;
+    int win_rows_ = 0, n_drafts_ = 0;
+    std::vector<int32_t> drafts_;
+    std::vector<float> dprobs_;
 };
 
 }  // namespace

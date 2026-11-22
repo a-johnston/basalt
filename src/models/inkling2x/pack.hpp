@@ -47,10 +47,21 @@ struct ExpertLayer {
     std::vector<ExpertBlob> blobs;   ///< per expert: one type pair for a whole layer, or each its own (a mixed-rate quant)
 };
 
+/// The DSpark drafter of a pack's dspark/gguf section (tools/convert/dspark_inkling2x.py), from meta.dspark.config.
+struct DsparkConfig {
+    int n_layers = 0, n_head = 0, n_kv = 0, head_dim = 0, n_ff = 0, window = 0, block = 0, rank = 0;
+    float rope_theta = 1e6f, rms_eps = 1e-6f;
+    std::vector<bool> local;          ///< per draft layer: attends the window before its block only
+    std::vector<int> target_visits;   ///< the target's layer visits whose input partial block is a feature; then the output
+};
+
 struct Pack {
     core::ModelFile file;
     Geometry geo;
     std::map<std::string, TensorRef> tensors;
+    bool has_dspark = false;
+    DsparkConfig dspark;
+    std::map<std::string, TensorRef> dspark_tensors;   ///< offsets absolute, as `tensors`
     std::vector<ExpertLayer> experts;   ///< per stored layer
     core::FileRange experts_range;
 

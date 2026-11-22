@@ -1,6 +1,7 @@
 // src/models/inkling2x/pack.cpp - reads the Inkling 2 pack's meta section.
 #include "models/inkling2x/pack.hpp"
 
+#include <algorithm>
 #include <sstream>
 
 namespace basalt::models::inkling2x {
@@ -110,6 +111,51 @@ bool open_pack(const std::string& path, Pack& p, std::string& err) {
         }
         r.offset = sec->offset + t.get("offset")->u64();
         p.tensors.emplace(name, std::move(r));
+    }
+    // the drafter, when the pack carries it
+    if (const Json* dj = meta.get("dspark"); dj && dj->is_object()) {
+        const Json* arch_j = dj->get("architecture");
+        const Json* cj = dj->get("config");
+        const Json* tj2 = dj->get("tensors");
+        const core::ModelFile::Section* sec = p.file.find("dspark/gguf");
+        if (!arch_j || !arch_j->is_string() || arch_j->s != "inkling2-dspark" || !cj || !tj2 || !sec) {
+            err = path + ": meta.dspark is not an Inkling 2 DSpark drafter (or its section is missing)";
+            return false;
+        }
+        DsparkConfig& c = p.dspark;
+        auto cu = [&](const char* k) { return (int) num_or(cj->get(k), 0); };
+        c.n_layers = cu("num_hidden_layers");
+        c.n_head = cu("num_attention_heads");
+        c.n_kv = cu("num_key_value_heads");
+        c.head_dim = cu("head_dim");
+        c.n_ff = cu("intermediate_size");
+        c.window = cu("sliding_window_size");
+        c.block = cu("block_size");
+        c.rank = cu("markov_rank");
+        c.rope_theta = (float) num_or(cj->get("rope_theta"), 1e6);
+        c.rms_eps = (float) num_or(cj->get("rms_norm_eps"), 1e-6);
+        c.local.assign((size_t) std::max(c.n_layers, 0), false);
+        for (double v : numbers(cj->get("local_layer_ids")))
+            if ((int) v >= 0 && (int) v < c.n_layers) c.local[(size_t) v] = true;
+        for (double v : numbers(cj->get("target_layer_ids"))) c.target_visits.push_back((int) v);
+        const bool any_local = std::find(c.local.begin(), c.local.end(), true) != c.local.end();
+        if (c.n_layers <= 0 || c.head_dim != 128 || c.n_kv <= 0 || c.n_head % c.n_kv || c.block < 2 || c.block > 16 || c.rank != 256 ||
+            c.target_visits.size() < 2 || (int) c.target_visits.size() > 4 || c.target_visits.back() != g.slots() || (any_local && c.window <= 0)) {
+            err = path + ": a DSpark drafter this engine does not run (heads of 128, blocks of 2 to 16, a Markov rank of 256, two to four "
+                         "features ending in the output, a window for its local layers)";
+            return false;
+        }
+        for (const auto& [name, t] : tj2->members) {
+            TensorRef r;
+            r.name = name;
+            r.type = (int) num_or(t.get("type_id"), 0);
+            if (const Json* sh = t.get("shape"))
+                for (const Json& d : sh->items) r.shape.push_back(d.u64());
+            r.bytes = (uint64_t) num_or(t.get("bytes"), 0);
+            r.offset = sec->offset + t.get("offset")->u64();
+            p.dspark_tensors.emplace(name, std::move(r));
+        }
+        p.has_dspark = true;
     }
     p.experts_range = p.file.range("experts");
     std::vector<uint8_t> text;
