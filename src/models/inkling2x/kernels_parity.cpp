@@ -668,24 +668,24 @@ void check_exl3_experts(bool bench = false) {
     void* scratch = zeros<uint8_t>(std::max(bk::native_expert_scratch_bytes(L[0], (int64_t) R * KTOP), bk::native_expert_scratch_bytes(L[1], (int64_t) R * KTOP)));
     float* eo = zeros<float>((size_t) R * KTOP * E);
     float* y = zeros<float>((size_t) R * E);
-    auto run = [&](int row, int rows, float* yy) {
+    auto run = [&](int row, int rows, float* yy) {   // yy null: the experts only (the benchmark)
         k::group_experts(idd + row * KTOP, rows, KTOP, NE, eptr, er, gp, gr, gs, ng, dst, tok, nullptr);
         bk::exl3_expert_grouped(L[0], gp, gs, ng, dst, tok, std::min(NE, rows * KTOP), rows * KTOP, x + row * E,
                                 scratch, eo, nullptr, 0, gr);
-        sum_experts_host(eo, wts.data() + row * KTOP, rows, yy);
+        if (yy) sum_experts_host(eo, wts.data() + row * KTOP, rows, yy);
     };
     if (bench) {   // a decode step, cycling through distinct picks so the blobs do not all fit in cache
         size_t bytes = 0;
         for (auto e : ids) bytes += L[cls[e]].bytes;
-        for (int r = 0; r < R; ++r) run(r, 1, y);
+        for (int r = 0; r < R; ++r) run(r, 1, nullptr);
         cudaDeviceSynchronize();
         constexpr int reps = 8;
         auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < reps; ++i)
-            for (int r = 0; r < R; ++r) run(r, 1, y);
+            for (int r = 0; r < R; ++r) run(r, 1, nullptr);
         if (cudaDeviceSynchronize() != cudaSuccess) { ++failures; return; }
         double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / (R * reps);
-        std::printf("EXL3 group + 8 experts + sum: %.1f us per call, %.0f GB/s of expert weights\n", us, (double) bytes / (R * us * 1e3));
+        std::printf("EXL3 group + 8 experts: %.1f us per call, %.0f GB/s of expert weights\n", us, (double) bytes / (R * us * 1e3));
         return;
     }
     run(0, R, y);
