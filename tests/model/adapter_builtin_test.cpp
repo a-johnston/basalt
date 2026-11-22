@@ -61,6 +61,14 @@ int main() {
 #else
     expect("inkling2", false);
 #endif
+#ifdef BASALT_MODEL_INKLING2X
+    expect("inkling2x", true);
+    // and under the architecture a pack converted from a GGUF keeps
+    check(model::find_adapter("inkling2_loop") != nullptr, "inkling2x also answers to inkling2_loop");
+    ++built;
+#else
+    expect("inkling2x", false);
+#endif
     check(model::adapter_names().size() == built, "registering twice keeps one adapter per name");
     if (const model::ModelAdapter* ds = model::find_adapter("deepseek41")) {
         model::Started started;
