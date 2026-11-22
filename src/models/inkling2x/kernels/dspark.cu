@@ -408,7 +408,7 @@ __global__ void __launch_bounds__(kPickThreads) markov_logits_kernel(const float
 // The step's draft (kJoinThreads threads): the rows within px::kDelta of the best approximate total (px::collect, up to
 // px::kMaxCand) rescored exactly, a warp a row: the Q8_0 head row against the step's q8_1 row x, plus the bias through
 // fold; the best exact capped logit is the draft (the lower row of equals), its probability against the blocks' softmax
-// of the approximate ones.  The token also goes to *prev and its w1 row to emb (null: not).
+// of the approximate ones with the rescored rows' terms exact.  The token also goes to *prev and its w1 row to emb (null: not).
 __global__ void __launch_bounds__(kJoinThreads) markov_join_kernel(const float* __restrict__ part, const float2* __restrict__ cand,
                                                                    const Q80B* __restrict__ head, const px::X81* __restrict__ x,
                                                                    const uint16_t* __restrict__ fold, const float* __restrict__ fold_b,
@@ -466,14 +466,20 @@ __global__ void __launch_bounds__(kJoinThreads) markov_join_kernel(const float* 
     __syncthreads();
     if (warp == 0) px::pick<false, false>(f, n, kPickBlocks, nullptr, nullptr, &pick, nullptr);
     __syncthreads();
-    if (tid == 0) {
+    if (tid == 0) {   // the probability: the blocks' sums with the rescored rows' approximate terms swapped for exact ones
         float m = -INFINITY, s = 0.0f, best = -INFINITY;
         int unused = 0;
         for (int w = 0; w < kJoinThreads / 32; ++w) pick_join(m, s, unused, jm[w], js[w], 0);
-        for (int c = 0; c < n; ++c)
+        float mx = m;
+        for (int c = 0; c < n; ++c) {
+            mx = fmaxf(mx, f.ex[c]);
             if (f.list[c] == pick) best = f.ex[c];
+        }
+        float sx = s * expf(m - mx);
+        for (int c = 0; c < n; ++c) sx += expf(f.ex[c] - mx) - expf(cap * tanhf(f.lp[c] / cap) - mx);
+        const float pb = expf(best - mx);
         *token = pick;
-        *prob = n > 0 && s > 0.0f ? fminf(1.0f, expf(best - m) / s) : 1.0f;
+        *prob = n > 0 ? pb / fmaxf(sx, pb) : 1.0f;
         *prev = pick;
     }
     if (emb && tid < kRank) emb[tid] = bf16_to_f(w1[(size_t) pick * kRank + tid]);

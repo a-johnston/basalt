@@ -73,7 +73,7 @@ void head_screen_scores(const void* screen, const void* x_q8_1, int n_act, int64
 /// [n_vocab][256] bf16, a Markov rank of 256, 16-byte aligned rows), with `base` the screen's approximate logits; the rows
 /// within 5 of the best total are rescored with the exact base (the Q8_0 head's row against the step's q8_1 row x_q8_1, 2304
 /// values), and the best exact one is the draft (the first of equals): token, and prob its probability against the
-/// approximate softmax. The token also goes to *prev and its w1 row to emb (null: not), for the next step.
+/// approximate softmax with the rescored rows' terms exact. The token also goes to *prev and its w1 row to emb (null: not), for the next step.
 size_t markov_pick_scratch_floats(int n_vocab);
 void markov_pick(const float* base, const void* head_q8_0, const void* x_q8_1, const uint16_t* fold, const float* fold_b, const float* latent,
                  int n_vocab, float cap, float* scratch, const uint16_t* w1, int32_t* token, float* prob, int32_t* prev, float* emb,

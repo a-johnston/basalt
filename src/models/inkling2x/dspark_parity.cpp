@@ -561,9 +561,9 @@ void check_markov_pick(bool last_wins) {
     const bool tok_ok = t == best || (t >= 0 && t < NV && xv[(size_t) best] - xv[(size_t) t] < 1e-4);
     std::printf("%-40s token %d (reference %d, gap to the second %.2e)  %s\n", name, t, best, xv[(size_t) best] - second, tok_ok ? "ok" : "FAIL");
     failures += !tok_ok;
-    // the probability is the pick's exact logit against the screen's approximate sum: within a factor of two
+    // the probability: the pick's exact logit against the copy's sum with the rescored rows' terms exact, within 10%
     const double p = down(prob, 1)[0], pr = 1.0 / l;
-    const bool p_ok = p > 0 && p <= 1 && p / pr < 2 && pr / p < 2;
+    const bool p_ok = p > 0 && p <= 1 && p / pr < 1.1 && pr / p < 1.1;
     std::printf("%-40s %.4f (reference %.4f)  %s\n", last_wins ? "  its probability (approximate)" : "  its probability (approximate)", p, pr,
                 p_ok ? "ok" : "FAIL");
     failures += !p_ok;
