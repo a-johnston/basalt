@@ -570,7 +570,7 @@ private:
             dump("gate-" + std::to_string(s), x.gate, (int64_t) R * nq);
         }
         ik::attention(x.q, x.r, x.sink, x.gate, F(l, "attn_rel_bias.weight"), caches, attn_args(s, l), run.m, x.pos, run.last(), x.ws, x.att,
-                      x.attq, stream_);
+                      x.attq, stream_, chunk ? run.first[0] : -1);
         if (diag()) dump("att-" + std::to_string(s), x.att, (int64_t) R * nq);
         if (prompt) {
             mmq::repack_d4(x.attq, x.escr, R, nq, stream_);

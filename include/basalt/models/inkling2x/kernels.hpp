@@ -116,10 +116,11 @@ struct AttnArgs {
 };
 size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys);
 /// `out_q8_1` (null: none) gets out's q8_1 blocks as quantize_q8_1_rows would make them. The drafter's attention passes
-/// null rel_bias, sinks and gate (no bias, a sink of 0, no gate) and sink_logit false.
+/// null rel_bias, sinks and gate (no bias, a sink of 0, no gate) and sink_logit false. A single-member prompt supplies
+/// its first absolute position for tiling full splits older than the relative bias.
 void attention(const float* q, const float* r, const float* sinks, const float* gate, const float* rel_bias, const KvCaches& caches,
                const AttnArgs& a, const Members& m, const int64_t* pos, int64_t p_last, void* ws, float* out, void* out_q8_1,
-               void* stream);
+               void* stream, int64_t prompt_first = -1);
 /// The split count of a launch of `rows` rows whose largest position is p_last: equal counts can share a captured launch.
 int attention_splits(const AttnArgs& a, int64_t p_last, int rows);
 

@@ -426,24 +426,25 @@ struct Attn {
     std::vector<float> q, k, v, r, sink, gate, qs, rs, rb;
 };
 
-// R = 3 takes the decode's splits of the keys; R = 17 (past a decode window) a prompt chunk's
+// R = 3 takes decode splits. The two prompt shapes exercise a partial tile and a split crossing the bias cutoff.
 void check_attention(bool full, int R) {
     const int W = full ? 0 : EXT;
     const int64_t pos0 = full ? 1500 : 1200;   // past the window / past the bias extent
-    const int64_t cells = full ? 16384 : W + 16;   // a full layer: a cell per position
+    const int64_t cells = full ? 16384 : W + std::max(R, 16);   // a full layer: a cell per position
     Attn h;
     h.q = randn((size_t) R * H * D);
     h.k = randn((size_t) R * HKV * D);
     h.v = randn((size_t) R * HKV * D);
     h.r = randn((size_t) R * H * DREL);
     h.sink = randn((size_t) R * H, 2.0f);
+    if (R == 128) std::fill(h.sink.begin(), h.sink.end(), 0.f);
     h.gate = randn((size_t) R * H * D);
     h.qs = randn((size_t) H * D, 1.0f);
     h.rs = randn((size_t) H * DREL, 1.0f);
     h.rb = randn((size_t) EXT * DREL, 0.5f);
     // the cached rows before pos0, as fp16
     std::vector<__half> kc((size_t) cells * HKV * D), vc((size_t) cells * HKV * D);
-    std::normal_distribution<float> nd(0.0f, 0.1f);
+    std::normal_distribution<float> nd(0.0f, full && R > 16 ? 1.0f : 0.1f);
     for (size_t i = 0; i < kc.size(); ++i) { kc[i] = __float2half(nd(rng)); vc[i] = __float2half(nd(rng)); }
     float *q = up(h.q), *kd = up(h.k), *vd = up(h.v), *r = up(h.r), *sink = up(h.sink), *gate = up(h.gate), *qs = up(h.qs), *rs = up(h.rs),
           *rb = up(h.rb);
@@ -454,8 +455,8 @@ void check_attention(bool full, int R) {
     pa.log_scale = full;
     pa.log_alpha = 0.1f;
     pa.log_floor = 8192.0f;
-    // a prompt past the log-scale floor: positions where tau > 1
-    const int64_t ppos = full ? 9000 : pos0;
+    // Full-layer positions on either side of the log-scale floor.
+    const int64_t ppos = full ? (R == 128 ? 3029 : 9000) : pos0;
     k::qkvr_prep(q, kd, vd, r, qs, rs, pa, members1(R), rowpos(ppos, R), caches1(kcd, vcd), cells, nullptr);
     // the reference preparation
     std::vector<double> qr((size_t) R * H * D), rr((size_t) R * H * DREL);
@@ -475,7 +476,7 @@ void check_attention(bool full, int R) {
             for (int d = 0; d < DREL; ++d) rr[((size_t) row * H + hh) * DREL + d] = u[d] * fr * tau;
         }
     }
-    report(full ? "Q prep, full layer (tau > 1)" : "Q prep, sliding layer", down(q, qr.size()), qr, 1e-5);
+    report(full ? "Q prep, full layer" : "Q prep, sliding layer", down(q, qr.size()), qr, 1e-5);
     report(full ? "R prep, full layer (tau > 1)" : "R prep, sliding layer", down(r, rr.size()), rr, 1e-5);
     // K and V in the cache, back as floats
     {
@@ -510,7 +511,7 @@ void check_attention(bool full, int R) {
     cudaMalloc(&ws, k::attention_workspace_bytes(R, H, maxk));
     float* out = zeros<float>((size_t) R * H * D);
     void* oq = zeros<uint8_t>((size_t) R * H * D / 32 * 36);
-    k::attention(q, r, sink, gate, rb, caches1(kcd, vcd), aa, members1(R), rowpos(apos, R), apos + R - 1, ws, out, oq, nullptr);
+    k::attention(q, r, sink, gate, rb, caches1(kcd, vcd), aa, members1(R), rowpos(apos, R), apos + R - 1, ws, out, oq, nullptr, apos);
     const auto qg = down(q, qr.size()), rg = down(r, rr.size());
     const auto kb = down(kcd, kc.size()), vb = down(vcd, vc.size());
     std::vector<double> ref((size_t) R * H * D);
@@ -557,6 +558,21 @@ void check_attention(bool full, int R) {
     }
     if (R > 16) {   // a row alone takes the decode's splits: not the same sums
         report(full ? "attention, full layer, prompt splits" : "attention, sliding, prompt splits", got, ref, 1e-4);
+        auto run = [&](int row, int count, bool prompt) {
+            const size_t h = (size_t) row * H;
+            k::attention(q + h * D, r + h * DREL, sink + h, gate + h * D, rb, caches1(kcd, vcd), aa, members1(count),
+                         rowpos(apos + row, count), apos + R - 1, ws, out, nullptr, nullptr, prompt ? apos + row : -1);
+            return down(out, (size_t) count * H * D);
+        };
+        const auto old = run(0, R, false);
+        report("attention vs scalar prompt", got, std::vector<double>(old.begin(), old.end()), 1e-4);
+        if (R == 128) {
+            const int start = 39;
+            const auto part = run(start, 31, true);
+            same("attention, shifted prompt tile", part.data(), got.data() + (size_t) start * H * D, part.size());
+            const auto alone = run(start, 1, false);
+            report("attention, one decode row", alone, std::vector<double>(part.begin(), part.begin() + H * D), 1e-4);
+        }
         return;
     }
     report(full ? "attention, full layer (> extent)" : "attention, sliding (wrapped ring)", got, ref, 1e-4);
@@ -565,13 +581,36 @@ void check_attention(bool full, int R) {
     same(full ? "attention, full layer" : "attention, sliding", down(one, (size_t) H * D).data(), got.data(), (size_t) H * D);
 }
 
+// At capacity the first and final cache rows have unit values. A zero query gives each visible key (and the sink)
+// equal mass. Use the same allocation for the largest prompt and the graph-rounded 16-row decode.
+void check_attention_capacity() {
+    constexpr int ctx = 131072, rows = 128;
+    auto* kv = zeros<__half>((size_t) ctx * HKV * D);
+    const std::vector<__half> ones(HKV * D, __float2half(1.f));
+    for (int p : {0, ctx - 1}) cudaMemcpy(kv + (size_t) p * HKV * D, ones.data(), ones.size() * sizeof(__half), cudaMemcpyHostToDevice);
+    float* q = zeros<float>((size_t) rows * H * D), *out = zeros<float>((size_t) rows * H * D);
+    void* ws = nullptr;
+    cudaMalloc(&ws, k::attention_workspace_bytes(rows, H, ctx));
+    k::AttnArgs a;
+    a.cells = ctx;
+    for (int n : {rows, 16}) {
+        const int first = ctx - n;
+        k::attention(q, nullptr, nullptr, nullptr, nullptr, caches1(kv, kv), a, members1(n), rowpos(first, n), ctx - 1,
+                     ws, out, nullptr, nullptr, n == rows ? first : -1);
+        std::vector<double> ref((size_t) n * H * D);
+        for (int i = 0; i < n; ++i) std::fill_n(ref.begin() + (size_t) i * H * D, H * D, (1. + (i == n - 1)) / (first + i + 2));
+        report("attention at capacity", down(out, ref.size()), ref, 1e-6);
+    }
+    cudaFree(ws); cudaFree(q); cudaFree(out); cudaFree(kv);
+}
+
 // ------------------------------------------------------------------------------------------ several conversations a run
 // Two members in one launch, each with its own ring and caches at its own positions, against each member alone: the
 // convolutions (and their rings), the attention's inputs (and the caches they write) and the attention, bit for bit.
-void check_members() {
+void check_members(bool wide) {
     const int SLOTS = 32, WIDTH = 6656, HW = 128, CK = 1024;
-    const int n0 = 2, n1 = 3, R = n0 + n1;
-    const int64_t p0 = 37, p1 = 1500, cells = 16384;
+    const int n0 = wide ? 17 : 2, n1 = wide ? 64 : 3, R = n0 + n1;
+    const int64_t p0 = 37, p1 = wide ? 3131 : 1500, cells = 4096;
     k::Members two;
     two.n = 2;
     two.start[1] = n0;
@@ -579,7 +618,7 @@ void check_members() {
     const int64_t* pos2 = rowpos(two, {p0, p1});
     bool ok = true;
     // convolutions: K with input taps
-    {
+    if (!wide) {
         auto x = randn((size_t) R * CK), w = randn((size_t) CK * 4, 0.3f), dy = randn((size_t) R * (CK / HW) * 4, 0.3f);
         auto ra = randn((size_t) SLOTS * WIDTH), rb = randn((size_t) SLOTS * WIDTH);
         float *ra2 = up(ra), *rb2 = up(rb), *ra1 = up(ra), *rb1 = up(rb), *xd = up(x), *wd = up(w), *dyd = up(dy);
@@ -989,11 +1028,15 @@ int main(int argc, char** argv) {
     check_control();
     check_norm_quant();
     check_conv();
-    check_members();
+    check_members(false);
+    check_members(true);
     check_attention(false, 3);
     check_attention(true, 3);
     check_attention(false, 17);
     check_attention(true, 17);
+    check_attention(false, 128);
+    check_attention(true, 128);
+    check_attention_capacity();
     check_experts();
     check_exl3_experts();
     check_logits();

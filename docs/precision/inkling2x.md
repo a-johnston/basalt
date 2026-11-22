@@ -46,6 +46,11 @@ The input codes and fp16 scales are copied from the same q8_1 blocks used by dec
 sums its whole dot product, so moving a row within a tile or shortening the chunk does not change that product. The prompt and
 decode products round differently; a changed prompt can change later tokens even though the decode kernels are unchanged.
 
+In full attention, complete 256-key splits older than a prompt row's relative-bias extent use fp16 queries and fp16
+unnormalized softmax weights for the two tensor-core products. Both products accumulate in fp32; the maximum, softmax
+sum, split merge, sink and gate stay fp32. Recent keys, sliding layers and decode do not use those rounded operands.
+The 512-token BF16 gate does not exercise the older splits.
+
 ## REXL3 conversion error
 
 In the REXL3 pack, all 478 F32 tensors and the BF16 token embedding match the corresponding tensors of the official checkpoint's
@@ -68,6 +73,11 @@ inside its integer dot. The repacked codes, widened scales and padding agree byt
 
 The prompt convolutions split each channel across row slices. Their outputs, residuals and complete rings (including cells
 not written by the chunk) match the serial convolutions bit for bit, including at a ring wrap and at the start of a prompt.
+
+At 24 query and 8 KV heads, full prompt attention differs from FP64 by at most 3.53e-5 absolute (1.50e-5 relative to
+the peak output) and from the scalar prompt splits by at most 3.53e-5 (1.50e-5 relative) in the random-input test.
+Moving rows across a history-tile or workspace-slice boundary preserves their bits. The emitted q8_1 blocks match a
+separate quantization of the fp32 output.
 
 ## The drafter
 

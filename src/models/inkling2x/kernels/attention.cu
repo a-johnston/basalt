@@ -9,6 +9,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "history.cuh"
+
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
@@ -40,12 +43,15 @@ __device__ __forceinline__ void unpack16(uint4 a, uint4 b, float (&f)[kPer]) {
 }
 
 // ws: m and l of each [row][head][split], then its 128 accumulators.  Grid (rows, n_kv, nsplit); G queries a K/V head.
-template<int G>
+template<int G, bool Tail = false>
 __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __restrict__ q, const float* __restrict__ r,
                                                                  const float* __restrict__ sinks, const float* __restrict__ rel_bias,
                                                                  KvCaches caches, AttnArgs a, Members mem, const int64_t* __restrict__ pos,
                                                                  int rows, int nsplit, int split, float* __restrict__ ws) {
-    const int row = blockIdx.x, g = blockIdx.y, sp = blockIdx.z;
+    const int row = blockIdx.x, g = blockIdx.y, sp = (Tail ? nsplit - (int) gridDim.z : 0) + blockIdx.z;
+    if constexpr (Tail) {
+        if (pos[row] >= (int64_t) (sp + 1) * kHistory - 1 + a.extent) return;
+    }
     const int mi = member_of(mem, row);
     const __half* __restrict__ kc = (const __half*) caches.k[mi];
     const __half* __restrict__ vc = (const __half*) caches.v[mi];
@@ -173,6 +179,12 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
     }
 }
 
+__global__ void history_kernel(const float* q, const float* sinks, const __half* kc, const __half* vc, int rows, int heads,
+                               int kv, int splits, int64_t first, int extent, float* ws) {
+    __shared__ HistoryTile tile;
+    history_stage(tile, blockIdx.x * 16, blockIdx.y, blockIdx.z, q, sinks, kc, vc, rows, heads, kv, splits, first, extent, ws);
+}
+
 // out, and with xq set its q8_1 blocks (a head's 128 values are four blocks, a warp each)
 __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __restrict__ gate, int n_head, int rows, int nsplit,
                                  bool sink_logit, float* __restrict__ out, Q81* __restrict__ xq) {
@@ -196,6 +208,9 @@ __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __re
 
 constexpr int kSplitRound = 8;   // a decode launch's split count, rounded up: a graph replays for 512 positions, not 64
 
+constexpr int kSliceRows = 64;   // long prompt partials share the workspace across row slices
+constexpr int kShortSplits = 8;
+
 int split_of(int rows) { return rows <= kDecodeRows ? kSplitDecode : kSplitPrompt; }
 int splits_of(int64_t keys, int split) {
     const int n = (int) ((keys + split - 1) / split);
@@ -208,20 +223,53 @@ int64_t keys_of(const AttnArgs& a, int64_t p_last) { return a.window > 0 && p_la
 int attention_splits(const AttnArgs& a, int64_t p_last, int rows) { return splits_of(keys_of(a, p_last), split_of(rows)); }
 
 size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys) {
-    auto need = [&](int r) { return (size_t) r * n_head * splits_of(max_keys, split_of(r)) * (2 + kHead) * sizeof(float); };
-    const size_t a = need(rows), b = need(rows < kDecodeRows ? rows : kDecodeRows);
-    return a > b ? a : b;
+    const size_t decode = (size_t) std::min(rows, kDecodeRows) * splits_of(max_keys, kSplitDecode);
+    const int splits = splits_of(max_keys, kSplitPrompt);
+    const size_t prompt = std::max((size_t) rows * std::min(splits, kShortSplits), (size_t) std::min(rows, kSliceRows) * splits);
+    return std::max(decode, prompt) * n_head * (2 + kHead) * sizeof(float);
 }
 
 void attention(const float* q, const float* r, const float* sinks, const float* gate, const float* rel_bias, const KvCaches& caches,
                const AttnArgs& a, const Members& m, const int64_t* pos, int64_t p_last, void* ws, float* out, void* out_q8_1,
-               void* stream) {
+               void* stream, int64_t prompt_first) {
     const int rows = m.rows();
     if (rows <= 0) return;
     const int split = split_of(rows), nsplit = attention_splits(a, p_last, rows);
+    if (rows > kSliceRows && nsplit > kShortSplits) {
+        // Balance the slices so even the last one uses prompt splits. A slice keeps its members' positions and caches.
+        const int slices = (rows + kSliceRows - 1) / kSliceRows;
+        for (int i = 0; i < slices; ++i) {
+            const int lo = i * rows / slices, hi = (i + 1) * rows / slices;
+            Members sub{};
+            sub.n = 0;
+            KvCaches kv{};
+            for (int j = 0; j < m.n; ++j) {
+                const int end = std::min(hi, m.start[j + 1]);
+                if (end <= std::max(lo, m.start[j])) continue;
+                kv.k[sub.n] = caches.k[j];
+                kv.v[sub.n] = caches.v[j];
+                sub.start[++sub.n] = end - lo;
+            }
+            const size_t h = (size_t) lo * a.n_head, d = h * kHead;
+            attention(q + d, r ? r + h * a.d_rel : nullptr, sinks ? sinks + h : nullptr, gate ? gate + d : nullptr,
+                      rel_bias, kv, a, sub, pos + lo, p_last, ws, out + d, out_q8_1 ? (Q81*) out_q8_1 + d / 32 : nullptr,
+                      stream, prompt_first >= 0 && m.n == 1 ? prompt_first + lo : -1);
+        }
+        return;
+    }
     cudaStream_t st = (cudaStream_t) stream;
+    static_assert(kHistory == kSplitPrompt);
     const dim3 grid((unsigned) rows, (unsigned) a.n_kv, (unsigned) nsplit);
-    switch (a.n_head / a.n_kv) {
+    const bool tiled = prompt_first >= 0 && rows > kDecodeRows && m.n == 1 && !a.window && p_last < a.cells &&
+                       a.n_head == 3 * a.n_kv && prompt_first + rows - a.extent >= kHistory;
+    if (tiled) {
+        const int history = (int) ((prompt_first + rows - a.extent) / kHistory);
+        const int tail = (int) (std::max<int64_t>(0, prompt_first + 1 - a.extent) / kHistory);
+        history_kernel<<<dim3((rows + 15) / 16, a.n_head, history), 128, 0, st>>>(q, sinks, (const __half*) caches.k[0],
+            (const __half*) caches.v[0], rows, a.n_head, a.n_kv, nsplit, prompt_first, a.extent, (float*) ws);
+        if (tail < nsplit) attn_split_kernel<3, true><<<dim3(rows, a.n_kv, nsplit - tail), kWarps * 32, 0, st>>>(
+            q, r, sinks, rel_bias, caches, a, m, pos, rows, nsplit, split, (float*) ws);
+    } else switch (a.n_head / a.n_kv) {
 #define X(G) case G: attn_split_kernel<G><<<grid, kWarps * 32, 0, st>>>(q, r, sinks, rel_bias, caches, a, m, pos, rows, nsplit, split, (float*) ws); break;
         X(1) X(2) X(3) X(4) X(6) X(8)
 #undef X
