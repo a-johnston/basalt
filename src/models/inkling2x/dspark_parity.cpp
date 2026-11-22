@@ -1,7 +1,8 @@
 // src/models/inkling2x/dspark_parity.cpp - the kernels of Inkling 2's DSpark drafter against plain CPU references in double,
 // at the drafter's geometry: the features kept per member (bf16), their mixes with q8_1 blocks, the query and key heads'
 // norms and RoPE into the fp16 caches, the residual norms, the gated MLP's q8_1 input, the mask rows, the block's attention
-// (a local layer past its window and a global layer past 512 keys, no sink, no bias, no gate), and the Markov head: its
+// (a local layer past its window, a global layer past 512 keys, and a global layer's ring under a window with a floor; no
+// sink, no bias, no gate), and the Markov head: its
 // context, a step, the previous token's row, the head's screen and the pick over the whole vocabulary.
 // A row's result must not depend on the rows beside it: the row checks also run their first row alone.
 #include "basalt/kernels/dense_ops.hpp"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace k = basalt::models::inkling2x::kernels;
@@ -303,12 +305,17 @@ void check_mask_rows() {
 
 // ------------------------------------------------------------------------------------------------ the block's attention
 // Every row of the block at position p0..p0+7 attends the keys up to the block's last (p0 + 7): the context's and the
-// block's own. A local layer sees the last `window` of them.
-void check_block_attention(bool local) {
-    const int64_t p0 = local ? 1500 : 700;   // a local layer past its window; a global one past 512 keys
+// block's own. A local layer sees the last `window` of them; a global layer's ring (--mtp-window) too, from its floor on.
+enum class Layer { Local, Global, Ring };
+void check_block_attention(Layer kind) {
+    const bool local = kind == Layer::Local, ring = kind == Layer::Ring;
+    const char* name = local ? "block attention, local" : ring ? "block attention, ring" : "block attention, global";
+    // a local layer past its window; a global one past 512 keys; a ring wrapped several times, its floor inside the window
+    const int64_t p0 = local ? 1500 : ring ? 9000 : 700;
     const int64_t plast = p0 + B - 1;
-    const int window = local ? 1024 + B : 0;
-    const int64_t cells = local ? window + 64 : 4096;
+    const int window = local ? 1024 + B : ring ? 2048 + B : 0;
+    const int64_t cells = local ? window + 64 : ring ? window + 128 : 4096;
+    const int64_t floor = ring ? plast - 700 : 0;
     std::vector<uint16_t> kc((size_t) cells * HKV * D), vc((size_t) cells * HKV * D);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     for (size_t i = 0; i < kc.size(); ++i) {
@@ -327,6 +334,8 @@ void check_block_attention(bool local) {
     aa.window = window;
     aa.cells = cells;
     aa.sink_logit = false;
+    int64_t* d_floor = ring ? up(std::vector<int64_t>{floor}) : nullptr;
+    aa.floor = d_floor;
     k::Members one, each;
     one.start[1] = B;
     each.n = B;
@@ -339,7 +348,7 @@ void check_block_attention(bool local) {
     void* oq = zeros<uint8_t>((size_t) B * H * D / 32 * 36);
     float* q = up(qh);
     k::attention(q, nullptr, nullptr, nullptr, nullptr, kv, aa, one, pos, plast, ws, out, oq, nullptr);
-    const int64_t lo = window > 0 && plast + 1 > window ? plast - window + 1 : 0;
+    const int64_t lo = std::max(window > 0 && plast + 1 > window ? plast - window + 1 : 0, floor);
     std::vector<double> ref((size_t) B * H * D);
     for (int r = 0; r < B; ++r)
         for (int h = 0; h < H; ++h) {
@@ -365,15 +374,24 @@ void check_block_attention(bool local) {
             for (int d = 0; d < D; ++d) ref[((size_t) r * H + h) * D + d] = o[(size_t) d] / l;
         }
     const auto got = down(out, ref.size());
-    report(local ? "block attention, local (past window)" : "block attention, global (> 512 keys)", got, ref, 1e-4);
-    verdict(local ? "block attention, local: q8_1 blocks" : "block attention, global: q8_1 blocks", q8_same(out, B, H * D, oq),
-            "bit for bit (quantize_q8_1_rows)");
+    const std::string n(name);
+    report((n + (local ? " (past window)" : ring ? " (floor in window)" : " (> 512 keys)")).c_str(), got, ref, 1e-4);
+    verdict((n + ": q8_1 blocks").c_str(), q8_same(out, B, H * D, oq), "bit for bit (quantize_q8_1_rows)");
     k::Members m1;
     m1.start[1] = 1;
     float* o1 = zeros<float>((size_t) H * D);
     k::attention(q, nullptr, nullptr, nullptr, nullptr, kv, aa, m1, pos, plast, ws, o1, nullptr, nullptr);
-    verdict(local ? "block attention, local: a row alone" : "block attention, global: a row alone",
-            std::memcmp(down(o1, (size_t) H * D).data(), got.data(), (size_t) H * D * 4) == 0, "bit for bit");
+    verdict((n + ": a row alone").c_str(), std::memcmp(down(o1, (size_t) H * D).data(), got.data(), (size_t) H * D * 4) == 0,
+            "bit for bit");
+    if (ring) {   // a floor below the window changes nothing: the launch without one, bit for bit
+        cudaMemcpy(d_floor, std::vector<int64_t>{plast - window - 5}.data(), 8, cudaMemcpyHostToDevice);
+        float* ob = zeros<float>((size_t) B * H * D), *on = zeros<float>((size_t) B * H * D);
+        k::attention(q, nullptr, nullptr, nullptr, nullptr, kv, aa, one, pos, plast, ws, ob, nullptr, nullptr);
+        aa.floor = nullptr;
+        k::attention(q, nullptr, nullptr, nullptr, nullptr, kv, aa, one, pos, plast, ws, on, nullptr, nullptr);
+        verdict((n + ": a floor below the window").c_str(),
+                std::memcmp(down(ob, ref.size()).data(), down(on, ref.size()).data(), ref.size() * 4) == 0, "bit for bit (no floor)");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------- Markov head
@@ -588,13 +606,14 @@ int main() {
     check_add_norm();
     check_swiglu();
     check_mask_rows();
-    check_block_attention(true);
-    check_block_attention(false);
+    check_block_attention(Layer::Local);
+    check_block_attention(Layer::Global);
     check_markov_context();
     check_markov_step();
     check_head_screen();
     check_markov_pick(false);
     check_markov_pick(true);
+    check_block_attention(Layer::Ring);   // last: the checks before it keep their inputs
     if (cudaDeviceSynchronize() != cudaSuccess) {
         std::printf("CUDA error: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;

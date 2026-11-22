@@ -59,8 +59,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
     __shared__ float tab[G][kSplitPrompt];   // the bias minus the sink by distance over this split's distances (capped at extent)
     __shared__ float wm[kWarps][G], wl[kWarps][G], wacc[kWarps][G][kHead];
     const long long p = pos[row];
-    const long long lo = key_lo(p, a.window) + (long long) sp * split;
-    const long long hi = lo + split - 1 < p ? lo + split - 1 : p;
+    const long long l0 = key_lo(p, a.window) + (long long) sp * split;
+    const long long hi = l0 + split - 1 < p ? l0 + split - 1 : p;
+    const long long lo = a.floor && *a.floor > l0 ? *a.floor : l0;
     float* wsm = ws, *wsl = ws + (size_t) rows * a.n_head * nsplit, *wsa = ws + 2 * (size_t) rows * a.n_head * nsplit;
     const size_t slot0 = ((size_t) row * a.n_head + (size_t) g * G) * nsplit + sp;   // head g G + hh at slot0 + hh nsplit
     if (lo > hi) {

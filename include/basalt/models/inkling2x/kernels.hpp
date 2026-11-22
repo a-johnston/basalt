@@ -113,6 +113,7 @@ struct AttnArgs {
     int n_head = 24, n_kv = 8, d_rel = 16, extent = 1024, window = 0;
     int64_t cells = 0;       ///< the caches' cells: position p in cell p % cells
     bool sink_logit = true;  ///< the softmax takes one more logit of 0 (the drafter's attention takes none)
+    const int64_t* floor = nullptr;   ///< keys at positions below *floor (device) are out too (null: none)
 };
 size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys);
 /// `out_q8_1` (null: none) gets out's q8_1 blocks as quantize_q8_1_rows would make them. The drafter's attention passes
