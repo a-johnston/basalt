@@ -31,7 +31,8 @@ Inputs
   --verify PACK      read PACK back against its source --gguf: every section's SHA-256, and every source tensor's
                      bytes (type, shape and SHA-256) at the place the pack's index and layout name; writes nothing.
                      A pack made with --nvfp4 is checked by repeating its roundings
-  --dspark FILE      deepseek41 only: the DSpark drafter GGUF, stored whole as the dspark/gguf section
+  --dspark FILE      deepseek41: the DSpark drafter GGUF, stored whole as the dspark/gguf section; inkling2x (with --into
+                     only): the checkpoint's mtp.safetensors, rewritten as dspark/gguf (tools/convert/dspark_inkling2x.py)
   --mtp-source DIR   the draft layer's BF16 tensors from `mtp_fetch.py fetch --out DIR`; without it there is no drafter
   --mtp-dense FILE   a tuned `mtp/dense` section (raw bytes, same layout as the source; needs --mtp-source); the packs
                      with a self-distilled MTP layer carry one. Its size is checked and its SHA-256 goes to meta.mtp.
@@ -192,17 +193,35 @@ def add_dspark(a) -> None:
         print(f"done: {pack} is back to {pack.stat().st_size} bytes")
         return
     dspark = Path(a.dspark)
-    check_dspark(dspark)
     m = ModelFile(str(pack))
     meta = json.loads(m.read("meta"))
-    if meta.get("arch") != "deepseek41":
-        die(f"{pack} is no deepseek41 pack")
-    meta["dspark"] = dspark_record(dspark)
+    src = str(dspark)
+    if meta.get("arch") == "inkling2x":   # the checkpoint's mtp.safetensors, rewritten (tools/convert/dspark_inkling2x.py)
+        import dspark_inkling2x as DI
+        if not dspark.is_file():
+            die(f"missing input: {dspark}")
+        try:
+            blob, record = DI.build(dspark, pack)
+        except DI.DsparkError as e:
+            die(str(e))
+        tmp = tempfile.NamedTemporaryFile(prefix="dspark-", suffix=".bin", dir=str(pack.parent), delete=False)
+        tmp.write(blob)
+        tmp.close()
+        src = tmp.name
+        meta["dspark"] = record
+    else:
+        check_dspark(dspark)
+        if meta.get("arch") != "deepseek41":
+            die(f"{pack} is no deepseek41 or inkling2x pack")
+        meta["dspark"] = dspark_record(dspark)
     meta["sources"].append(source_record(dspark))
     try:
-        append_section(str(pack), "dspark/gguf", str(dspark), json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), a.undo_dir)
+        append_section(str(pack), "dspark/gguf", src, json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), a.undo_dir)
     except (ValueError, FileExistsError) as e:
         die(str(e))
+    finally:
+        if src != str(dspark):
+            os.unlink(src)
     m = ModelFile(str(pack))
     if not m.verify("dspark/gguf") or not m.verify("meta"):
         die(f"{pack}: the new sections do not read back as written; --roll-back puts the file back")
@@ -1096,7 +1115,8 @@ def main():
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--hf-dir", metavar="DIR", help="hy_v4_flash: the tencent/Hy4-flash directory (LICENSE, config.json)")
     ap.add_argument("--verify", metavar="PACK.basalt", help="read PACK back against its source --gguf and report; writes nothing")
-    ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
+    ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf; inkling2x (with "
+                    "--into): the checkpoint's mtp.safetensors (config.json beside it), rewritten as dspark/gguf")
     ap.add_argument("--dfly", metavar="FILE", help="hy4flash: the DFly2 drafter's safetensors (model.dfly_layers.*), stored whole as dfly")
     ap.add_argument("--nvfp4", action="store_true",
                     help="hy4flash: from the BF16 GGUF, the routed experts as NVFP4, projections Q8_0, the Engram table E4M3 (needs --hf-dir)")

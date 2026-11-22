@@ -62,8 +62,9 @@ class Inkling2Test(unittest.TestCase):
         convert.export_tokenizer = self._orig
         self.tmp.cleanup()
 
-    def write(self, drop=(), split_layer=None, kv=None):
-        """The GGUF: fused experts in every layer (separate gate and up as well in `split_layer`), `drop` keys left out."""
+    def write(self, drop=(), split_layer=None, kv=None, head=False):
+        """The GGUF: fused experts in every layer (separate gate and up as well in `split_layer`), `drop` keys left out,
+        with `head` an output.weight."""
         g = GGUFWriter()
         g.add("general.architecture", "inkling2_loop")
         g.add("general.quantized_by", "Someone")
@@ -79,6 +80,9 @@ class Inkling2Test(unittest.TestCase):
             g.add_raw(name, shape, ty, data)
 
         raw("token_embd.weight", [N_EMBD, 8], "Q8_0")
+        if head:   # real Q8_0 blocks: a drafter folds it
+            self.raw["output.weight"] = S.q8_0(self.rng.standard_normal(N_EMBD * 8).astype(np.float32))
+            g.add_raw("output.weight", [N_EMBD, 8], "Q8_0", self.raw["output.weight"])
         g.add_f32("token_embd_norm.weight", self.rng.standard_normal(N_EMBD))
         for l in range(N_LAYERS):
             g.add_f32(f"blk.{l}.ffn_gate_inp.weight", self.rng.standard_normal((N_EMBD, N_EXPERT)))
