@@ -100,9 +100,8 @@ private:
 }  // namespace
 
 std::unique_ptr<model::ModelAdapter> make_adapter() {
-    // A pack converted from a GGUF keeps that file's `general.architecture` (inkling2_loop) in its gguf_kv, which is what
-    // the registry looks an adapter up by; the same adapter answers to it.
-    if (model::find_adapter(kGgufArch) == nullptr) model::register_adapter(std::make_unique<Adapter>(kGgufArch));
+    // The registry looks an adapter up by a file's `general.architecture`: a pack says inkling2x there (its keys keep the
+    // GGUF's inkling2_loop prefix). The GGUF's own name is left to no adapter here, as `inkling2` is upstream's.
     return std::make_unique<Adapter>(kArch);
 }
 

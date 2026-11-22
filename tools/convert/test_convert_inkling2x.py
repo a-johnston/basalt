@@ -117,6 +117,7 @@ class Inkling2Test(unittest.TestCase):
             self.assertEqual(m.section(n)[0] % SECTION_ALIGN, 0, n)
         meta = json.loads(m.read("meta"))
         self.assertEqual(meta["arch"], "inkling2x")
+        self.assertEqual(meta["gguf_kv"]["general.architecture"], "inkling2x")
         self.assertEqual(meta["name"], "Inkling-2-Mini IQ4_NL")
         self.assertEqual((meta["license"]["name"], meta["license"]["quantized_by"]), ("Apache-2.0", "Someone"))
         self.assertIn("TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION", meta["license"]["text"])

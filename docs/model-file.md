@@ -283,7 +283,8 @@ python3 tools/convert/convert.py --verify Inkling-2-Mini-IQ3_XXS-test.basalt --g
   tensors.
 - `experts`, `experts.layout` (v5): one row per layer from llama.cpp's fused `ffn_gate_up_exps` (the gate's rows first, so an
   expert's slice is already `[gate | up]`) and `ffn_down_exps`.
-- `meta`: `arch` `inkling2x`, `geometry` (the GGUF's `inkling2_loop.*` keys, the loop's among them), `license` (Apache-2.0 with its
+- `meta`: `arch` `inkling2x` and `general.architecture` `inkling2x` in `gguf_kv` (the backend's name; the keys keep the
+  GGUF's `inkling2_loop.*` prefix), `geometry` (those keys, the loop's among them), `license` (Apache-2.0 with its
   text, which the release requires in every copy). `vision` and `mtp` are null.
 
 ## Inkling 2 Mini EXL3 pack (`inkling2x`)

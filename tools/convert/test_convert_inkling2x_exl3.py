@@ -165,6 +165,7 @@ class Inkling2Exl3Test(unittest.TestCase):
             self.assertEqual(experts[off:off + nb], want + vec)
         meta = json.loads(m.read("meta"))
         self.assertEqual(meta["arch"], "inkling2x")
+        self.assertEqual(meta["gguf_kv"]["general.architecture"], "inkling2x")
         self.assertEqual(meta["exl3"]["experts"]["rates gate-up/down bpw -> experts"], {"2.5/3": 4, "3/3.5": 4})
 
     def test_tensor_forms(self):

@@ -63,9 +63,7 @@ int main() {
 #endif
 #ifdef BASALT_MODEL_INKLING2X
     expect("inkling2x", true);
-    // and under the architecture a pack converted from a GGUF keeps
-    check(model::find_adapter("inkling2_loop") != nullptr, "inkling2x also answers to inkling2_loop");
-    ++built;
+    check(model::find_adapter("inkling2_loop") == nullptr, "inkling2x does not answer to the GGUF's inkling2_loop");
 #else
     expect("inkling2x", false);
 #endif

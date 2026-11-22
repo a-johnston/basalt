@@ -43,8 +43,8 @@ inline Loop loop_of(const GgufFile& g) {
 inline std::string validate_meta(const GgufFile& g) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
-    if (arch->s != kGgufArch && arch->s != kArch)
-        return "architecture is '" + arch->s + "', this adapter requires '" + kArch + "' (or '" + kGgufArch + "', a GGUF's)";
+    if (arch->s != kArch)
+        return "architecture is '" + arch->s + "', this adapter requires '" + kArch + "'";
     for (const char* k : {"block_count", "embedding_length", "expert_count", "expert_used_count", "expert_feed_forward_length",
                           "attention.key_length", "attention.sliding_window", "attention.relative_length",
                           "attention.relative_extent", "shortconv.l_cache", "attn_res.block_size", "loop.end", "loop.count",

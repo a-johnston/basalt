@@ -980,6 +980,7 @@ def from_exl3_inkling2x(a, base: ModelFile, base_meta: dict) -> None:
             tensors = {x.name: {"type": x.type_name, "type_id": x.type_id, "shape": x.ne, "bytes": x.nbytes(), "offset": o}
                        for x, o in zip(model.tensors, offs)}
             kv = dict(base_meta.get("gguf_kv", {}))
+            kv["general.architecture"] = "inkling2x"
             kv["general.file_type"] = 7
             if a.name:
                 kv["general.name"] = a.name

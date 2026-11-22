@@ -63,6 +63,9 @@ class Inkling2(Arch):
     def meta_extra(self, kv, tensors, own):
         return {
             "arch": self.name,
+            # the engine and the server pick the backend by general.architecture: inkling2x, not the GGUF's inkling2_loop
+            # (the keys keep its prefix)
+            "gguf_kv": {**kv, "general.architecture": self.name},
             "geometry": {k[len(P):]: v for k, v in kv.items() if k.startswith(P)},
             "vision": None,
             "mtp": None,

@@ -26,7 +26,7 @@ class Fixtures(unittest.TestCase):
     def test_inkling_fixtures_leave_the_model_role_to_be_generated(self):
         for name in ("conv", "struct", "prose"):
             with self.subTest(fixture=name):
-                t = ids(BENCH / "inkling2_loop" / f"{name}.ids")
+                t = ids(BENCH / "inkling2x" / f"{name}.ids")
                 self.assertEqual(t[:2], [200002, 200004])  # system text: thinking effort 0
                 self.assertIn([200010, 200000, 200004], [t[i:i+3] for i in range(len(t))])  # user text
                 self.assertEqual(t[-1], 200010)  # end of user message, not end of sampling
