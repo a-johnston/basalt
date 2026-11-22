@@ -221,11 +221,11 @@ public:
 
     int batch_rows() const override { return kMaxWindow; }
 
-    // a window: the anchor and up to block - 1 drafts while the drafter runs
-    int max_window() const override {
-        const DsparkConfig* c = m_.dspark();
-        return c ? std::max(1, std::min(m_.spec(), c->block)) : 1;
-    }
+    // a window while the drafter runs: up to --spec rows (the drafter's own fill its block at most, a prompt lookup's more)
+    int max_window() const override { return m_.dspark() ? std::max(1, std::min(m_.spec(), kMaxWindow)) : 1; }
+    // a window's drafts may be a prompt lookup's (--suffix-draft): every row is verified alike, and its features become
+    // the drafter's context whoever proposed it
+    bool copy_drafts() const override { return max_window() > 1; }
 
     // ---- drafting: the rows of the last window before `pos` were accepted, so their features become the drafter's context;
     // then its block after `anchor` (the token at `pos`), run to the end here (it shares the forward's scratch)

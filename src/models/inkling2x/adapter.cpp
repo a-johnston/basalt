@@ -10,12 +10,15 @@
 #include "models/inkling2x/meta.hpp"
 #include "models/inkling2x/model.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <optional>
 #include <string>
 
 namespace basalt::models::inkling2x {
 namespace {
+
+constexpr int kWindowRows = 16;   // a decode window's rows (the session's kMaxWindow): the drafter's block, or a prompt lookup's longer
 
 class Adapter final : public model::ModelAdapter {
 public:
@@ -46,14 +49,19 @@ public:
 
     bool parse_flag(const std::string& a, model::FlagArgs& args, program::CommonOptions& o, int& code) const override {
         (void) code;
-        if (a != "--spec") return false;
-        o.spec = std::atoi(args.next("--spec"));
-        o.spec_given = true;
+        if (a == "--spec") {
+            o.spec = std::atoi(args.next("--spec"));
+            o.spec_given = true;
+        } else if (a == "--suffix-draft") {
+            o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
+        } else {
+            return false;
+        }
         return true;
     }
 
-    // The pack's DSpark drafter offers its whole block (the anchor and the drafts) unless --spec caps it; a pack without one
-    // decodes plainly.
+    // With the pack's DSpark drafter a window holds up to 16 rows unless --spec caps it: the drafter's own fill its block
+    // (8), a prompt lookup's (--suffix-draft) the rest; a pack without one decodes plainly.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
         core::ModelFile file;
         std::string err;
@@ -62,14 +70,14 @@ public:
             if (const core::Json* d = file.meta().get("dspark"))
                 if (const core::Json* c = d->get("config"))
                     if (const core::Json* b = c->get("block_size")) block = (int) b->num();
-        if (!o.spec_given) o.spec = block;
+        if (!o.spec_given) o.spec = block > 0 ? kWindowRows : 0;   // a prompt lookup's windows past the drafter's block pay
         if (o.spec >= 2 && block == 0) {
             basalt::log::warn("basalt inkling2x", "--spec %d off: the pack has no dspark/gguf section", o.spec);
             o.spec = 0;
         }
-        if (block > 0 && o.spec > block) {
-            basalt::log::warn("basalt inkling2x", "--spec %d: the drafter's block holds %d rows", o.spec, block);
-            o.spec = block;
+        if (block > 0 && o.spec > kWindowRows) {
+            basalt::log::warn("basalt inkling2x", "--spec %d: a window holds %d rows", o.spec, kWindowRows);
+            o.spec = kWindowRows;
         }
         return std::nullopt;
     }
