@@ -93,8 +93,9 @@ sets acceptance only:
 - **Arithmetic:** fp32 throughout, where vLLM rounds its block's activations and the Markov head's state to BF16; the target's
   features are BF16 as in vLLM; K and V in fp16 caches.
 - **Window:** where the caches of its full-attention layer do not fit at the context asked (the 2.92 bpw pack at 128K on a 16
-  GB card), that layer keeps a ring of the last positions that do (`mtp-window`), as its local layers keep their 1,024. Keys a
-  rewind left stale are skipped, not read. Below the window the drafts are the same bits; past it a reply that draws on text
+  GB card), that layer keeps a ring of the last positions that do (`mtp-window`), as its local layers keep their 1,024: the last
+  90,112 for that pack, which then leaves no room for the server's buffer to defer checkpoints, so each is copied out at once
+  (4.3 ms against 0.5). Keys a rewind left stale are skipped, not read. Below the window the drafts are the same bits; past it a reply that draws on text
   older than the window loses acceptance. With the 2.26 bpw pack at 128K (every position fits), 512 greedy tokens, 8-row
   windows, no prompt lookup, tokens a window:
 

@@ -1038,9 +1038,9 @@ model::Result make_sessions(Inkling2Model& model, int n, std::vector<std::unique
     const DsparkConfig* c = model.dspark();
     if (!c) return {};
     // The drafter's full layers attend every position when each session's caches for them fit beside what is allocated
-    // later (lazily loaded kernels and graphs; the copy of one session's running state a server snapshots checkpoints
-    // into) and the VRAM a start leaves free, else the longest window (a multiple of kWindowStep) that does;
-    // --mtp-window sets it.
+    // later (lazily loaded kernels and graphs) and the VRAM a start leaves free, else the longest window (a multiple of
+    // kWindowStep) that does; --mtp-window sets it. The window comes before a server's buffer to defer checkpoints:
+    // without one a checkpoint copies out at once, a few ms a turn.
     int64_t window = model.draft_window();
     const char* why = "--mtp-window";
     if (window < 0) {
@@ -1049,8 +1049,7 @@ model::Result make_sessions(Inkling2Model& model, int n, std::vector<std::unique
         const uint64_t cell = (uint64_t) full * 2 * c->n_kv * c->head_dim * 2;   // fp16 K and V a position
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const uint64_t keep = ((uint64_t) std::max(model.vram_reserve_mib(), platform::vram_floor_mib() + kLateMib) << 20) +
-                              made[0]->running_bytes();
+        const uint64_t keep = (uint64_t) std::max(model.vram_reserve_mib(), platform::vram_floor_mib() + kLateMib) << 20;
         const uint64_t room = free_b > keep ? (free_b - keep) / (uint64_t) n : 0;
         if (room >= cell * (uint64_t) model.context()) {
             window = 0;
