@@ -2,7 +2,7 @@
 // at the drafter's geometry: the features kept per member (bf16), their mixes with q8_1 blocks, the query and key heads'
 // norms and RoPE into the fp16 caches, the residual norms, the gated MLP's q8_1 input, the mask rows, the block's attention
 // (a local layer past its window and a global layer past 512 keys, no sink, no bias, no gate), and the Markov head: its
-// context, a step, the previous token's row, and the pick over the whole vocabulary.
+// context, a step, the previous token's row, the head's screen and the pick over the whole vocabulary.
 // A row's result must not depend on the rows beside it: the row checks also run their first row alone.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/models/inkling2x/dspark_kernels.hpp"
@@ -22,7 +22,7 @@ namespace bk = basalt::kernels;
 
 namespace {
 
-constexpr int E = 2304, H = 24, HKV = 8, D = 128, RANK = 256, NF = 4, B = 8, NV = 200058;
+constexpr int E = 2304, H = 24, HKV = 8, D = 128, RANK = 256, NF = 4, B = 8;
 constexpr float EPS = 1e-6f, THETA = 1e6f, CAP = 30.0f;
 std::mt19937 rng(11);
 int failures = 0;
@@ -420,8 +420,110 @@ void check_markov_step() {
     report("Markov step: latent", down(lat, (size_t) RANK), lr, 1e-5);
 }
 
-// the pick: logits over the vocabulary, the argmax, its probability, the next step's inputs
+// ------------------------------------------------------------------------------------------- the head's screen
+// A Q8_0 head of n rows of 2304 (random codes, fp16 scales) and its q8_1 activations, on the card.
+struct Head {
+    int n;
+    std::vector<uint8_t> w;   // [n][72] blocks of {fp16 d, int8 qs[32]}
+    uint8_t *dw = nullptr, *screen = nullptr;
+};
+Head make_head(int n, float scale) {
+    Head h;
+    h.n = n;
+    h.w.resize((size_t) n * 72 * 34);
+    std::uniform_int_distribution<int> q(-127, 127);
+    std::uniform_real_distribution<float> d(0.5f * scale, 1.5f * scale);
+    for (size_t b = 0; b < (size_t) n * 72; ++b) {
+        const __half hd = __float2half(d(rng));
+        std::memcpy(&h.w[b * 34], &hd, 2);
+        for (int i = 0; i < 32; ++i) h.w[b * 34 + 2 + (size_t) i] = (uint8_t) (int8_t) q(rng);
+    }
+    h.dw = up(h.w);
+    h.screen = zeros<uint8_t>(k::head_screen_bytes(n));
+    k::head_screen_pack(h.dw, n, h.screen, nullptr);
+    return h;
+}
+// q8_1 rows of x (rows x 2304) made on the card, and their values {d, qs} back
+struct Act {
+    void* dq = nullptr;
+    std::vector<uint8_t> q;
+};
+Act make_act(int rows) {
+    Act a;
+    const float* x = up(randn((size_t) rows * E, 1.0f));
+    a.dq = zeros<uint8_t>((size_t) rows * 72 * 36);
+    bk::quantize_q8_1_rows(x, rows, E, a.dq, nullptr);
+    a.q = down((const uint8_t*) a.dq, (size_t) rows * 72 * 36);
+    return a;
+}
+double half_at(const uint8_t* p) {
+    uint16_t u;
+    std::memcpy(&u, p, 2);
+    return __half2float(__ushort_as_half(u));
+}
+// the exact logit of head row r against activation row a, in double
+double exact_logit(const Head& h, const Act& x, int r, int a) {
+    double t = 0;
+    for (int b = 0; b < 72; ++b) {
+        const uint8_t* wb = &h.w[((size_t) r * 72 + b) * 34];
+        const uint8_t* xb = &x.q[((size_t) a * 72 + b) * 36];
+        long sumi = 0;
+        for (int i = 0; i < 32; ++i) sumi += (long) (int8_t) wb[2 + i] * (long) (int8_t) xb[4 + i];
+        t += half_at(wb) * half_at(xb) * (double) sumi;
+    }
+    return t;
+}
+
+// The screen's scores against the copy it reads, decoded on the host in double: head_proxy.cuh's layout (tiles of 32
+// rows; a row's words two groups a uint4 at lane = row, levels 2 bits from bit 2 ii of byte bb for value c 16 + 4 ii +
+// bb; an fp16 scale a group) times the activations' q8_1 values.  Then how far the copy is from the head itself.
+void check_head_screen() {
+    const int N = 1000, R = 3;   // a tile's tail
+    Head h = make_head(N, 0.002f);
+    Act x = make_act(R);
+    float* out = zeros<float>((size_t) R * N);
+    k::head_screen_scores(h.screen, x.dq, R, N, out, N, nullptr);
+    const auto got = down(out, (size_t) R * N);
+    const auto cp = down(h.screen, k::head_screen_bytes(N));
+    const int tiles = (N + 31) / 32, nw4 = E / 64;
+    const uint32_t* wq = (const uint32_t*) cp.data();
+    const uint8_t* sc = cp.data() + (size_t) tiles * nw4 * 32 * 16;
+    std::vector<double> ref((size_t) R * N);
+    double err = 0, top = 0;
+    for (int r = 0; r < N; ++r) {
+        const int tile = r >> 5, lane = r & 31;
+        for (int a = 0; a < R; ++a) {
+            double t = 0;
+            for (int g = 0; g < 72; ++g) {
+                const int w4 = g / 2, hh = g & 1;
+                const size_t at = ((size_t) tile * nw4 + w4) * 32 + lane;
+                const double sg = half_at(sc + (at * 2 + hh) * 2);
+                const uint8_t* xb = &x.q[((size_t) a * 72 + g) * 36];
+                for (int c = 0; c < 2; ++c) {
+                    const uint32_t word = wq[at * 4 + 2 * hh + c];
+                    for (int ii = 0; ii < 4; ++ii)
+                        for (int bb = 0; bb < 4; ++bb) {
+                            const int lvl = (int) ((word >> (8 * bb + 2 * ii)) & 3u);
+                            t += sg * (lvl - 1.5) * half_at(xb) * (double) (int8_t) xb[4 + c * 16 + 4 * ii + bb];
+                        }
+                }
+            }
+            ref[(size_t) a * N + r] = t;
+            const double e = exact_logit(h, x, r, a);
+            err = std::max(err, std::fabs(t - e));
+            top = std::max(top, std::fabs(e));
+        }
+    }
+    report("head screen: scores of its copy (3 rows)", got, ref, 1e-5);
+    std::printf("%-40s the copy's largest error %.3f against logits up to %.3f (approximate by design)\n", "head screen vs the head", err, top);
+}
+
+// The pick on a 50003-token head: the screen's approximate base, the Markov bias, the best rows rescored on the head;
+// against the exact capped logits of every token in double.
 void check_markov_pick(bool last_wins) {
+    const int NV = 50003;   // past whole sweeps of the grid, and past the last group of four rows
+    Head h = make_head(NV, 0.002f);
+    Act x = make_act(1);
     std::vector<uint16_t> fold((size_t) NV * RANK), w1((size_t) NV * RANK);
     {
         const auto f = randn(fold.size(), 0.05f), e = randn(w1.size(), 0.5f);
@@ -430,46 +532,50 @@ void check_markov_pick(bool last_wins) {
             w1[i] = bf16(e[i]);
         }
     }
-    auto base = randn(NV, 3.0f);
-    if (last_wins) base[(size_t) NV - 1] = 60.0f;   // the vocabulary's tail (past the last whole group of rows)
-    const auto fb = randn(NV, 0.5f);
+    auto fb = randn(NV, 0.5f);
+    if (last_wins) fb[(size_t) NV - 1] = 60.0f;   // the vocabulary's last token
     std::vector<float> lat(RANK);
-    for (float& x : lat) x = std::tanh(randn(1, 1.0f)[0]);
+    for (float& v : lat) v = std::tanh(randn(1, 1.0f)[0]);
+    float* base = zeros<float>((size_t) NV);
+    k::head_screen_scores(h.screen, x.dq, 1, NV, base, NV, nullptr);
     float* scratch = zeros<float>(k::markov_pick_scratch_floats(NV));
     int32_t *tok = zeros<int32_t>(1), *prev = zeros<int32_t>(1);
     float *prob = zeros<float>(1), *emb = zeros<float>(RANK);
-    k::markov_pick(up(base), up(fold), up(fb), up(lat), NV, CAP, scratch, up(w1), tok, prob, prev, emb, nullptr);
-    std::vector<double> x((size_t) NV);
+    k::markov_pick(base, h.dw, x.dq, up(fold), up(fb), up(lat), NV, CAP, scratch, up(w1), tok, prob, prev, emb, nullptr);
+    std::vector<double> xv((size_t) NV);
     int best = 0;
     for (int v = 0; v < NV; ++v) {
         double d = 0;
         for (int i = 0; i < RANK; ++i) d += unbf16(fold[(size_t) v * RANK + i]) * lat[(size_t) i];
-        x[(size_t) v] = CAP * std::tanh((base[(size_t) v] + d + fb[(size_t) v]) / CAP);
-        if (x[(size_t) v] > x[(size_t) best]) best = v;
+        xv[(size_t) v] = CAP * std::tanh((exact_logit(h, x, v, 0) + d + fb[(size_t) v]) / CAP);
+        if (xv[(size_t) v] > xv[(size_t) best]) best = v;
     }
     double second = -1e300, l = 0;
     for (int v = 0; v < NV; ++v) {
-        if (v != best) second = std::max(second, x[(size_t) v]);
-        l += std::exp(x[(size_t) v] - x[(size_t) best]);
+        if (v != best) second = std::max(second, xv[(size_t) v]);
+        l += std::exp(xv[(size_t) v] - xv[(size_t) best]);
     }
     const int t = down(tok, 1)[0], pv = down(prev, 1)[0];
-    const char* name = last_wins ? "Markov pick (the last token wins)" : "Markov pick (200058 tokens)";
+    const char* name = last_wins ? "Markov pick, screened (the last wins)" : "Markov pick, screened (50003 tokens)";
     // a pick within fp32's reach of the best (a gap under 1e-4) is a tie the reference cannot order
-    const bool tok_ok = t == best || (t >= 0 && t < NV && x[(size_t) best] - x[(size_t) t] < 1e-4);
-    std::printf("%-40s token %d (reference %d, gap to the second %.2e)  %s\n", name, t, best, x[(size_t) best] - second,
-                tok_ok ? "ok" : "FAIL");
+    const bool tok_ok = t == best || (t >= 0 && t < NV && xv[(size_t) best] - xv[(size_t) t] < 1e-4);
+    std::printf("%-40s token %d (reference %d, gap to the second %.2e)  %s\n", name, t, best, xv[(size_t) best] - second, tok_ok ? "ok" : "FAIL");
     failures += !tok_ok;
-    report(last_wins ? "Markov pick's probability (last)" : "Markov pick's probability", down(prob, 1), {1.0 / l}, 1e-4);
+    // the probability is the pick's exact logit against the screen's approximate sum: within a factor of two
+    const double p = down(prob, 1)[0], pr = 1.0 / l;
+    const bool p_ok = p > 0 && p <= 1 && p / pr < 2 && pr / p < 2;
+    std::printf("%-40s %.4f (reference %.4f)  %s\n", last_wins ? "  its probability (approximate)" : "  its probability (approximate)", p, pr,
+                p_ok ? "ok" : "FAIL");
+    failures += !p_ok;
     std::vector<double> er(RANK);
-    for (int i = 0; i < RANK; ++i) er[(size_t) i] = unbf16(w1[(size_t) t * RANK + i]);
+    for (int i = 0; i < RANK; ++i) er[(size_t) i] = unbf16(w1[(size_t) std::max(t, 0) * RANK + i]);
     const auto eg = down(emb, (size_t) RANK);
     bool emb_ok = pv == t;
     for (int i = 0; i < RANK; ++i) emb_ok &= eg[(size_t) i] == (float) er[(size_t) i];
-    verdict(last_wins ? "Markov pick's next inputs (last)" : "Markov pick's next inputs", emb_ok, "the token's row, bit for bit");
-    // markov_embed: the same row from the token
+    verdict("  its next inputs", emb_ok, "the token's row, bit for bit");
     float* e2 = zeros<float>(RANK);
     k::markov_embed(up(w1), tok, RANK, e2, nullptr);
-    verdict(last_wins ? "Markov embed (last)" : "Markov embed", down(e2, (size_t) RANK) == eg, "bit for bit");
+    verdict("  Markov embed", down(e2, (size_t) RANK) == eg, "bit for bit");
 }
 
 }  // namespace
@@ -486,6 +592,7 @@ int main() {
     check_block_attention(false);
     check_markov_context();
     check_markov_step();
+    check_head_screen();
     check_markov_pick(false);
     check_markov_pick(true);
     if (cudaDeviceSynchronize() != cudaSuccess) {

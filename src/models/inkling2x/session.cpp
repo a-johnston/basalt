@@ -777,8 +777,10 @@ private:
             gemv(D(i, "ffn_down.weight"), x.dhq, x.dadd, c->n_ff, E, B);
         }
         ik::add_norm_quant(x.dres, x.dadd, TF("dspark.output_norm"), B, E, eps, x.dh, x.dxq, stream_);
-        // the target head on the mask rows (their own positions' predictions), then the Markov head's steps
-        gemv(m_.tensor("output.weight"), x.dxq + q8(E), x.hl, E, g_.vocab_padded, steps);
+        // the mask rows' base logits (their own positions' predictions) from the head's screen, then the Markov head's
+        // steps, each rescoring its best rows on the head itself
+        const DevTensor* head = m_.tensor("output.weight");
+        ik::head_screen_scores(m_.head_screen(), x.dxq + q8(E), steps, g_.n_vocab, x.hl, g_.vocab_padded, stream_);
         const float* W = TF("dspark.markov_rnn");
         const uint16_t* w1 = (const uint16_t*) m_.dtensor("dspark.markov_token_embd")->ptr;
         const uint16_t* fold = (const uint16_t*) m_.dtensor("dspark.markov_fold")->ptr;
@@ -788,8 +790,8 @@ private:
         // each step over the whole vocabulary: the Markov bias moves tokens from past the base logits' best few hundred to the top
         for (int k = 0; k < steps; ++k) {
             ik::markov_step(x.mctx + (size_t) k * 3 * rank, W, x.memb, rank, E, x.mraw, x.mstate, x.mlatent, stream_);
-            ik::markov_pick(x.hl + (size_t) k * g_.vocab_padded, fold, TF("dspark.markov_fold_bias"), x.mlatent, g_.n_vocab, g_.logit_cap, x.mpick,
-                            w1, x.tokens + k, x.probs + k, x.prev, x.memb, stream_);
+            ik::markov_pick(x.hl + (size_t) k * g_.vocab_padded, head->ptr, x.dxq + (size_t) (1 + k) * q8(E), fold, TF("dspark.markov_fold_bias"),
+                            x.mlatent, g_.n_vocab, g_.logit_cap, x.mpick, w1, x.tokens + k, x.probs + k, x.prev, x.memb, stream_);
         }
         if (cudaGetLastError() != cudaSuccess) {
             err = "a kernel failed to launch";

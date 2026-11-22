@@ -5,6 +5,7 @@
 #include "basalt/core/loader.hpp"
 #include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/log.hpp"
+#include "basalt/models/inkling2x/dspark_kernels.hpp"
 #include "basalt/platform/file.hpp"
 
 #include <cuda_runtime.h>
@@ -14,6 +15,7 @@
 
 namespace basalt::models::inkling2x {
 namespace {
+namespace ik = kernels;
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 }
 
@@ -21,6 +23,7 @@ Inkling2Model::~Inkling2Model() {
     for (auto* m : {&dev_, &dsp_})
         for (auto& [name, t] : *m)
             if (t.ptr) t.host ? cudaFreeHost(t.ptr) : cudaFree(t.ptr);
+    if (screen_) cudaFree(screen_);
     if (experts_) cudaFree(experts_);
     if (d_ptr_) cudaFree(d_ptr_);
     if (d_rates_) cudaFree(d_rates_);
@@ -202,6 +205,20 @@ model::Result Inkling2Model::attach(const model::LoadRequest& req, std::vector<s
             for (int j = 0; j < nf; ++j) sum += std::exp(w[(size_t) r * nf + j] - mx);
             for (int j = 0; j < nf; ++j) fuse_alpha_[(size_t) r * nf + j] = std::exp(w[(size_t) r * nf + j] - mx) / sum;
         }
+        // the head's 2-bit copy, packed from the head on the card: the draft's base logits read it instead of the head
+        const DevTensor* head = tensor("output.weight");
+        const int64_t vocab = pack_.geo.n_vocab;
+        if (!head || head->type != 8 || head->shape.size() != 2 || head->shape[0] != 2304 || head->shape[1] < (uint64_t) vocab)
+            return {model::Status::Error, "inkling2x: the drafter screens a Q8_0 head of rows of 2304, which this pack does not have"};
+        const size_t sb = ik::head_screen_bytes(vocab);
+        if (cudaMalloc(&screen_, sb) != cudaSuccess) {
+            cudaGetLastError();
+            screen_ = nullptr;
+            return {model::Status::Error, "inkling2x: out of device memory for the drafter's head screen"};
+        }
+        ik::head_screen_pack(head->ptr, vocab, screen_, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) return {model::Status::Error, "inkling2x: packing the drafter's head screen failed"};
+        basalt::log::info("basalt inkling2x", "the drafter's head screen: %.2f GiB", (double) sb / kGiB);
     }
     return make_sessions(*this, std::max(req.sessions, 1), sessions);
 }

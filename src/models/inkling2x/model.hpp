@@ -50,6 +50,9 @@ public:
     const DevTensor* dtensor(int layer, const char* suffix) const { return dtensor("dspark.blk." + std::to_string(layer) + "." + suffix); }
     /// softmax(fuse) per row: [n_layers + 1][features], row n_layers the Markov head's (host).
     const std::vector<float>& fuse_alpha() const { return fuse_alpha_; }
+    /// The 2-bit copy of the head the drafter screens its base logits with (dspark_kernels.hpp's head_screen_*); null
+    /// without the drafter.
+    const void* head_screen() const { return screen_; }
     const std::string& diag_dump() const { return diag_dump_; }
 
 private:
@@ -58,6 +61,7 @@ private:
     std::map<std::string, DevTensor> dev_, dsp_;
     bool dsp_on_ = false;
     std::vector<float> fuse_alpha_;
+    void* screen_ = nullptr;
     uint8_t* experts_ = nullptr;
     std::vector<::basalt::kernels::NativeExpertLayout> layouts_;
     std::vector<bool> mixed_;

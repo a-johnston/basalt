@@ -61,11 +61,22 @@ void markov_step(const float* ctx, const float* W, const float* emb, int rank, i
 /// emb = w1[*token] (w1 [n_vocab][rank] bf16, which may be mapped host memory: one row crosses the bus) as fp32.
 void markov_embed(const uint16_t* w1, const int32_t* token, int rank, float* emb, void* stream);
 
-/// The step's draft: logit[v] = cap tanh((base[v] + fold[v] . latent + fold_b[v]) / cap) over v < n_vocab (fold [n_vocab][256]
-/// bf16, a Markov rank of 256, 16-byte aligned rows); token = argmax (the first of equals), prob = its softmax probability.
-/// The token also goes to *prev and its w1 row to emb (null: not), for the next step.
+/// The draft head's screen (as Hy4-flash's drafter screens its head): basalt/kernels/head_proxy.cuh's 2-bit copy of a Q8_0
+/// head of n_rows rows of 2304, its bytes and its packing; then for up to kScreenMaxRows q8_1 rows x ([n_act][72 blocks])
+/// the copy's approximate logit of every head row, out[a * ld + row].
+constexpr int kScreenMaxRows = 8;
+size_t head_screen_bytes(int64_t n_rows);
+void head_screen_pack(const void* head_q8_0, int64_t n_rows, void* screen, void* stream);
+void head_screen_scores(const void* screen, const void* x_q8_1, int n_act, int64_t n_rows, float* out, int ld, void* stream);
+
+/// The step's draft: the capped logit cap tanh((base[v] + fold[v] . latent + fold_b[v]) / cap) over v < n_vocab (fold
+/// [n_vocab][256] bf16, a Markov rank of 256, 16-byte aligned rows), with `base` the screen's approximate logits; the rows
+/// within 5 of the best total are rescored with the exact base (the Q8_0 head's row against the step's q8_1 row x_q8_1, 2304
+/// values), and the best exact one is the draft (the first of equals): token, and prob its probability against the
+/// approximate softmax. The token also goes to *prev and its w1 row to emb (null: not), for the next step.
 size_t markov_pick_scratch_floats(int n_vocab);
-void markov_pick(const float* base, const uint16_t* fold, const float* fold_b, const float* latent, int n_vocab, float cap, float* scratch,
-                 const uint16_t* w1, int32_t* token, float* prob, int32_t* prev, float* emb, void* stream);
+void markov_pick(const float* base, const void* head_q8_0, const void* x_q8_1, const uint16_t* fold, const float* fold_b, const float* latent,
+                 int n_vocab, float cap, float* scratch, const uint16_t* w1, int32_t* token, float* prob, int32_t* prev, float* emb,
+                 void* stream);
 
 }  // namespace basalt::models::inkling2x::kernels
