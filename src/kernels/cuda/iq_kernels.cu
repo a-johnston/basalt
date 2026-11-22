@@ -1644,6 +1644,37 @@ __device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8
         if (EXACT_N || c < n) s[c] = warp_sum(s[c]);
 }
 
+// row_dot_multi for RPW rows at once: each row's terms and sums are row_dot_multi's, in its order, so each (row, column)
+// is bitwise its own row_dot_multi; a column's activation words are read once for the RPW rows instead of once a row.
+template<int TY, int NC, int RPW, bool STAGE_GRID = false>
+__device__ __forceinline__ void row_dot_rows(const uint8_t* const (&rows)[RPW], const block_q8_1* x, const int (&off)[NC], int n,
+                                             int nb, int lane, float (&s)[RPW][NC], const uint32_t* __restrict__ s_grid = nullptr) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+#pragma unroll
+    for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[r][c] = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[RPW];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) w[r] = S::template load<STAGE_GRID>(rows[r], kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) {
+                const block_q8_1* xc = x + off[c] + kbx * (F::qk / 32);
+#pragma unroll
+                for (int r = 0; r < RPW; ++r) s[r][c] += S::apply(w[r], xc, iqs);
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < RPW; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) s[r][c] = warp_sum(s[r][c]);
+}
+
 // 8-lane sub-warp row dot for K = nb * ipb == 40 (IQ4_NL, NVFP4 or an APR trellis down with n_ff == 640):
 // 4 rows per warp (32 rows per 256-thread block), 100% active lanes, bitwise identical addition tree to row_dot_multi.
 template<int TY, int NC, bool EXACT_N = false, bool PRE = false, bool STAGE_GRID = false>
@@ -1813,16 +1844,45 @@ __device__ __forceinline__ void mmvq_multi_row(const uint8_t* __restrict__ w, si
     }
 }
 
-template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>>
+// RPW > 1: the warp's rows row0 .. row0 + RPW - 1 together (row_dot_rows), each bitwise mmvq_multi_row's; rows past
+// n_out are computed on the last row and not stored.
+template<int TY, int NC, int RPW, bool STAGE_GRID>
+__device__ __forceinline__ void mmvq_rows(const uint8_t* __restrict__ w, size_t row_bytes, const block_q8_1* __restrict__ x,
+                                          float* __restrict__ y, int n_in, int n_out, int ncols, int row0, const uint32_t* s_grid) {
+    if constexpr (RPW == 1) {
+        mmvq_multi_row<TY, NC, STAGE_GRID>(w, row_bytes, x, y, n_in, n_out, ncols, row0, s_grid);
+    } else {
+        const int lane = threadIdx.x;
+        const int nb = n_in / Fmt<TY>::qk, xb = n_in / 32;
+        const uint8_t* wr[RPW];
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) wr[r] = w + (size_t) min(row0 + r, n_out - 1) * row_bytes;
+        for (int c0 = 0; c0 < ncols; c0 += NC) {
+            const int n = min(NC, ncols - c0);
+            int off[NC];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) off[c] = (c0 + min(c, n - 1)) * xb;
+            float s[RPW][NC];
+            row_dot_rows<TY, NC, RPW, STAGE_GRID>(wr, x, off, n, nb, lane, s, s_grid);
+#pragma unroll
+            for (int r = 0; r < RPW; ++r)
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (row0 + r < n_out && c < n && lane == c) y[(size_t) (c0 + c) * n_out + row0 + r] = s[r][c];
+        }
+    }
+}
+
+template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>, int RPW = 1>
 __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
                                                          const block_q8_1* __restrict__ x, float* __restrict__ y,
                                                          int n_in, int n_out, int ncols) {
     __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, STAGE_GRID>::value];
     const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
     pdl_wait();   // the grid table above is constant
-    const int row = blockIdx.x * 4 + threadIdx.y;
+    const int row = (blockIdx.x * 4 + threadIdx.y) * RPW;
     if (row >= n_out) return;
-    mmvq_multi_row<TY, NC, STAGE_GRID>(w, row_bytes, x, y, n_in, n_out, ncols, row, s_grid);
+    mmvq_rows<TY, NC, RPW, STAGE_GRID>(w, row_bytes, x, y, n_in, n_out, ncols, row, s_grid);
 }
 
 // iq_mmvq_set: the matrices' blocks of 4 rows side by side, blk0[m] the first block of matrix m.
@@ -1834,7 +1894,8 @@ struct MmvqSetArgs {
     int n;
 };
 
-template<int TY, int NC>
+// RPW: as mmvq_multi_kernel's (blk0 counts blocks of 4 RPW rows).
+template<int TY, int NC, int RPW = 1>
 __global__ void __launch_bounds__(128) mmvq_set_kernel(MmvqSetArgs a, size_t row_bytes, const block_q8_1* __restrict__ x, int n_in,
                                                        int ncols) {
     __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, false>::value];
@@ -1842,9 +1903,9 @@ __global__ void __launch_bounds__(128) mmvq_set_kernel(MmvqSetArgs a, size_t row
     pdl_wait();
     int m = 0;
     while (m + 1 < a.n && (int) blockIdx.x >= a.blk0[m + 1]) ++m;
-    const int row = ((int) blockIdx.x - a.blk0[m]) * 4 + threadIdx.y;
+    const int row = (((int) blockIdx.x - a.blk0[m]) * 4 + threadIdx.y) * RPW;
     if (row >= a.n_out[m]) return;
-    mmvq_multi_row<TY, NC, false>(a.w[m], row_bytes, x, a.y[m], n_in, a.n_out[m], ncols, row, s_grid);
+    mmvq_rows<TY, NC, RPW, false>(a.w[m], row_bytes, x, a.y[m], n_in, a.n_out[m], ncols, row, s_grid);
 }
 
 // ---------------------------------------------------------------- grouped native experts
@@ -3380,6 +3441,12 @@ int mmvq_mma_sms() {
 // more than it saved there, while the grouped expert kernels gain (bitwise the same either way).
 constexpr bool g_stage_grid_mmvq = false;
 
+// Q8_0 at five to eight columns takes two rows a warp (row_dot_rows: the same bits, each column's activation words read
+// once for both rows): Inkling 2's 8-row draft block and its 6- and 8-row verify windows are about 4% faster (a 6-row
+// window 13.62 -> 13.16 ms, an 8-row one 16.55 -> 16.00, RTX 5080 at 360 W).  Four rows a warp, or two at fewer
+// columns, were slower there: fewer warps keep fewer of the weights' loads in flight.
+template<int TY, int NC> inline constexpr int kRowsPerWarp = (TY == 8 && NC >= 6) ? 2 : 1;
+
 template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
@@ -3417,11 +3484,16 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
         else if (ncols <= 6 && g_nc6) go(mmvq_multi_kernel<TY, 6>);
         else go(mmvq_multi_kernel<TY, 8>);
     } else {
+        // blocks of 4 kRowsPerWarp rows
+        auto go_r = [&](auto kernel, int rpw) {
+            launch_pdl(kernel, dim3((unsigned) ((n_out + 4 * rpw - 1) / (4 * rpw))), block, 0, s, W, rb, X, y, n_in, n_out, ncols);
+        };
+        constexpr bool SG = kStageIqGrid<TY>;
         if (ncols <= 1) go(mmvq_multi_kernel<TY, 1>);
         else if (ncols == 2) go(mmvq_multi_kernel<TY, 2>);
         else if (ncols <= 4) go(mmvq_multi_kernel<TY, 4>);
-        else if (ncols <= 6 && g_nc6) go(mmvq_multi_kernel<TY, 6>);
-        else go(mmvq_multi_kernel<TY, 8>);   // 8 at a time past 8
+        else if (ncols <= 6 && g_nc6) go_r(mmvq_multi_kernel<TY, 6, SG, kRowsPerWarp<TY, 6>>, kRowsPerWarp<TY, 6>);
+        else go_r(mmvq_multi_kernel<TY, 8, SG, kRowsPerWarp<TY, 8>>, kRowsPerWarp<TY, 8>);   // 8 at a time past 8
     }
 }
 
@@ -3433,21 +3505,22 @@ bool launch_mmvq_set(const MmvqSet& set, size_t rb, const block_q8_1* X, int n_i
         return false;
     } else {
         if (g_old_kernels || (TY == 21 && ncols >= 2)) return false;   // IQ3_S's tensor-core path takes 2 columns and up
+        const int rpw = ncols <= 4 ? 1 : (ncols <= 6 && g_nc6) ? kRowsPerWarp<TY, 6> : kRowsPerWarp<TY, 8>;
         MmvqSetArgs a{};
         a.n = set.n;
         for (int i = 0; i < set.n; ++i) {
             a.w[i] = (const uint8_t*) set.w[i];
             a.y[i] = set.y[i];
             a.n_out[i] = set.n_out[i];
-            a.blk0[i + 1] = a.blk0[i] + (set.n_out[i] + 3) / 4;
+            a.blk0[i + 1] = a.blk0[i] + (set.n_out[i] + 4 * rpw - 1) / (4 * rpw);
         }
         const dim3 grid((unsigned) a.blk0[set.n]), block(32, 4);
         auto go = [&](auto kernel) { launch_pdl(kernel, grid, block, 0, s, a, rb, X, n_in, ncols); };
         if (ncols <= 1) go(mmvq_set_kernel<TY, 1>);
         else if (ncols == 2) go(mmvq_set_kernel<TY, 2>);
         else if (ncols <= 4) go(mmvq_set_kernel<TY, 4>);
-        else if (ncols <= 6 && g_nc6) go(mmvq_set_kernel<TY, 6>);
-        else go(mmvq_set_kernel<TY, 8>);
+        else if (ncols <= 6 && g_nc6) go(mmvq_set_kernel<TY, 6, kRowsPerWarp<TY, 6>>);
+        else go(mmvq_set_kernel<TY, 8, kRowsPerWarp<TY, 8>>);
         return true;
     }
 }
