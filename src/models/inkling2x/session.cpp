@@ -66,7 +66,7 @@ public:
                   alloc((void**) &grp_rates_, g_.n_expert * sizeof(*grp_rates_), err) && alloc((void**) &grp_start_, (g_.n_expert + 1) * 4, err) &&
                   alloc((void**) &n_groups_, 4, err) &&
                   alloc((void**) &ent_dst_, (size_t) R * K * 4, err) && alloc((void**) &ent_tok_, (size_t) R * K * 4, err) &&
-                  f(eout_, (size_t) R * K * E) && f(moe_, (size_t) R * E) && f(mc_, (size_t) R * E) && f(ctlg_, (size_t) R * g_.gate_rank) &&
+                  f(eout_, (size_t) R * K * E) && f(mc_, (size_t) R * E) && f(ctlg_, 3 * (size_t) R * g_.gate_rank) &&
                   f(hn_, (size_t) R * E) && b(hq_, (size_t) kMaxWindow * q8) && f(hl_, (size_t) kMaxWindow * g_.vocab_padded) &&
                   f(logits_, (size_t) kMaxWindow * g_.n_vocab) && alloc((void**) &pick_, (size_t) (3 * kMaxWindow) * 4, err) &&
                   f(lp_, bk::row_logprobs_scratch_floats(kMaxWindow, g_.n_vocab) + (size_t) kMaxWindow * bk::kLogprobStride) &&
@@ -228,7 +228,6 @@ private:
     void gemv(const DevTensor* w, const void* xq, float* y, int n_in, int n_out, int R) {
         bk::iq_mmvq(w->type, w->ptr, xq, y, n_in, n_out, R, stream_);
     }
-    void quant(const float* x, int R, int n, void* xq) { bk::quantize_q8_1_rows(x, R, n, xq, stream_); }
 
     // projections of the q8_1 inputs xq[in]: those of one input and one type in one launch (each bitwise its own gemv)
     struct Proj {
@@ -276,22 +275,19 @@ private:
             static const char* ctl[3][3] = {{"loop_q_ctrl_down.weight", "loop_q_ctrl_gain.weight", "loop_q_ctrl_forget.weight"},
                                             {"loop_k_ctrl_down.weight", "loop_k_ctrl_gain.weight", "loop_k_ctrl_forget.weight"},
                                             {"loop_v_ctrl_down.weight", "loop_v_ctrl_gain.weight", "loop_v_ctrl_forget.weight"}};
+            ik::CtlJob cj[3];
             for (int j = 0; j < 3; ++j) {
-                ik::loop_control(in[j], msg_ + j * RE, F(l, ctl[j][0]), F(l, ctl[j][1]), F(l, ctl[j][2]), R, E, g_.gate_rank, kMixEps, ctlg_,
-                                 ctl_ + j * RE, stream_);
+                cj[j] = {in[j], msg_ + j * RE, F(l, ctl[j][0]), F(l, ctl[j][1]), F(l, ctl[j][2]), ctl_ + j * RE};
                 in[j] = ctl_ + j * RE;
             }
+            ik::loop_control(cj, 3, R, E, g_.gate_rank, kMixEps, ctlg_, stream_);
         }
-        // the input norms, and each distinct normed input quantized once
-        int distinct = 3;
-        if (swa && !bank) {
-            bk::rms_norm_rows(in[0], F(l, "attn_norm.weight"), nrm_, R, E, g_.rms_eps, stream_);
-            distinct = 1;
-        } else {
-            static const char* full[3] = {"attn_q_inp_norm.weight", "attn_k_inp_norm.weight", "attn_v_inp_norm.weight"};
-            for (int j = 0; j < 3; ++j) bk::rms_norm_rows(in[j], F(l, swa ? "attn_norm.weight" : full[j]), nrm_ + j * RE, R, E, g_.rms_eps, stream_);
-        }
-        for (int j = 0; j < distinct; ++j) quant(nrm_ + j * RE, R, E, (uint8_t*) xq_ + j * R * q8(E));
+        // the input norms and their q8_1 blocks: one input on a sliding layer outside the loop's later passes, else three
+        const int distinct = swa && !bank ? 1 : 3;
+        static const char* full[3] = {"attn_q_inp_norm.weight", "attn_k_inp_norm.weight", "attn_v_inp_norm.weight"};
+        ik::NormJob nj[3];
+        for (int j = 0; j < distinct; ++j) nj[j] = {in[j], F(l, swa ? "attn_norm.weight" : full[j])};
+        ik::norm_quant(nj, distinct, R, E, g_.rms_eps, nrm_, xq_, stream_);
         const void* xq[3];
         for (int j = 0; j < 3; ++j) xq[j] = (uint8_t*) xq_ + (distinct == 1 ? 0 : j) * R * q8(E);
         Proj pr[8] = {{T(l, "attn_q.weight"), q_, nq, 0},          {T(l, "attn_k.weight"), kraw_, nkv, 1},
@@ -307,10 +303,20 @@ private:
         const float kv_scale = 1.0f / std::sqrt((float) ((swa ? 1 : 2) * g_.n_conv + 1));
         const float post_scale = 1.0f / std::sqrt((float) (g_.n_conv + 1));
         const int keep = std::min(R, kRing - 3);
-        ik::short_conv(kraw_, F(l, "attn_k_conv.weight"), swa ? nullptr : dk_, kHead, ring, 0, d_pos_, R, nkv, kv_scale, k_, stream_);
-        ik::short_conv(vraw_, F(l, "attn_v_conv.weight"), swa ? nullptr : dv_, kHead, ring, nkv, d_pos_, R, nkv, kv_scale, v_, stream_);
-        ik::conv_store(kraw_, ring, 0, d_pos_, R, keep, nkv, stream_);
-        ik::conv_store(vraw_, ring, nkv, d_pos_, R, keep, nkv, stream_);
+        ik::ConvJob kj, vj;
+        kj.x = kraw_;
+        kj.w = F(l, "attn_k_conv.weight");
+        kj.dyn = swa ? nullptr : dk_;
+        kj.out = k_;
+        kj.C = nkv;
+        kj.scale = kv_scale;
+        vj = kj;
+        vj.x = vraw_;
+        vj.w = F(l, "attn_v_conv.weight");
+        vj.dyn = swa ? nullptr : dv_;
+        vj.out = v_;
+        vj.ch0 = nkv;
+        ik::conv_rows(kj, &vj, kHead, ring, d_pos_, R, keep, stream_);
         ik::PrepArgs pa;
         pa.n_head = g_.n_head;
         pa.n_kv = g_.n_kv;
@@ -334,31 +340,36 @@ private:
         }
         const ik::AttnArgs aa = attn_args(s, l);
         ik::attention(q_, r_, sink_, gate_, F(l, "attn_rel_bias.weight"), kc_[(size_t) s], vc_[(size_t) s], aa, d_pos_, pos0, R, ws_, att_,
-                      stream_);
+                      attq_, stream_);
         if (diag()) dump("att-" + std::to_string(s), att_, (int64_t) R * nq);
-        quant(att_, R, nq, attq_);
         gemv(T(l, "attn_output.weight"), attq_, o_, nq, E, R);
-        ik::short_conv(o_, F(l, "attn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv, d_pos_, R, E, post_scale, oc_, stream_);
-        ik::conv_store(o_, ring, 2 * nkv, d_pos_, R, keep, E, stream_);
+        // the output's convolution into the residual: a block's first layer starts a new stream (the one before joins the
+        // mixed states), the others add
+        ik::ConvJob oj;
+        oj.x = o_;
+        oj.w = F(l, "attn_post_conv.weight");
+        oj.out = diag() ? oc_ : nullptr;
+        oj.ch0 = 2 * nkv;
+        oj.C = E;
+        oj.scale = post_scale;
+        const bool start = l % g_.block == 0;
+        ik::conv_residual(oj, nullptr, nullptr, 0, kHead, ring, d_pos_, R, keep, cur_, start ? blk_[(size_t) s] : nullptr, stream_);
+        if (start) blocks.push_back(blk_[(size_t) s]);
         if (diag()) dump("attn_out-" + std::to_string(s), oc_, (int64_t) RE);
-        // a block's first layer starts a new residual stream; the one before joins the mixed states
-        if (l % g_.block == 0) {
-            cudaMemcpyAsync(blk_[(size_t) s], cur_, RE * 4, cudaMemcpyDeviceToDevice, stream_);
-            blocks.push_back(blk_[(size_t) s]);
-            cudaMemcpyAsync(cur_, oc_, RE * 4, cudaMemcpyDeviceToDevice, stream_);
-        } else {
-            bk::add_inplace(cur_, oc_, (int64_t) RE, stream_);
-        }
         if (diag()) dump("ffn_inp-" + std::to_string(s), cur_, (int64_t) RE);
         // the FFN over the states mixed with its own query
         ik::depth_mix(states(blocks, cur_), F(l, "ffn_res_query.weight"), 1, R, E, kMixEps, fx_, stream_);
         const float* fin = fx_;
         if (bank) {
-            ik::loop_control(fx_, msg_ + 3 * RE, F(l, "loop_ffn_ctrl_down.weight"), F(l, "loop_ffn_ctrl_gain.weight"),
-                             F(l, "loop_ffn_ctrl_forget.weight"), R, E, g_.gate_rank, kMixEps, ctlg_, fc_, stream_);
+            const ik::CtlJob fj{fx_, msg_ + 3 * RE, F(l, "loop_ffn_ctrl_down.weight"), F(l, "loop_ffn_ctrl_gain.weight"),
+                                F(l, "loop_ffn_ctrl_forget.weight"), fc_};
+            ik::loop_control(&fj, 1, R, E, g_.gate_rank, kMixEps, ctlg_, stream_);
             fin = fc_;
         }
-        bk::rms_norm_rows(fin, F(l, "ffn_norm.weight"), fn_, R, E, g_.rms_eps, stream_);
+        const auto& lay = m_.expert_layout(l);
+        const bool exl3 = bk::cpu::exl3_supported(lay.gu_type);   // EXL3 experts read the normed rows in fp32, the others q8_1
+        const ik::NormJob nf{fin, F(l, "ffn_norm.weight")};
+        ik::norm_quant(&nf, 1, R, E, g_.rms_eps, fn_, exl3 ? nullptr : fxq_, stream_);
         bk::RouterArgs ra;
         ra.n_expert = g_.n_expert;
         ra.n_embd = E;
@@ -366,22 +377,24 @@ private:
         ra.weight_scale = g_.expert_scale;
         ra.gate = bk::RouterGate::Sigmoid;
         bk::router(fn_, F(l, "ffn_gate_inp.weight"), F(l, "exp_probs_b.bias"), R, ra, rlog_, ids_, rw_, stream_);
-        const auto& lay = m_.expert_layout(l);
         const auto* rates = m_.expert_rates(l);
         const int entries = R * g_.n_used, groups = std::min(g_.n_expert, entries);
         ik::group_experts(ids_, R, g_.n_used, g_.n_expert, m_.expert_ptrs(l), rates, grp_ptr_, grp_rates_, grp_start_, n_groups_,
                           ent_dst_, ent_tok_, stream_);
-        if (bk::cpu::exl3_supported(lay.gu_type)) {
+        if (exl3) {
             bk::exl3_expert_grouped(lay, grp_ptr_, grp_start_, n_groups_, ent_dst_, ent_tok_, groups, entries, fn_, escr_, eout_, stream_,
                                     0, rates ? grp_rates_ : nullptr);
         } else {
-            quant(fn_, R, E, fxq_);
             bk::native_expert_grouped(lay, grp_ptr_, grp_start_, n_groups_, ent_dst_, ent_tok_, groups, entries, fxq_, escr_, eout_, stream_);
         }
-        ik::sum_experts(eout_, rw_, R, g_.n_used, E, moe_, stream_);
-        ik::short_conv(moe_, F(l, "ffn_post_conv.weight"), nullptr, kHead, ring, 2 * nkv + E, d_pos_, R, E, post_scale, mc_, stream_);
-        ik::conv_store(moe_, ring, 2 * nkv + E, d_pos_, R, keep, E, stream_);
-        bk::add_inplace(cur_, mc_, (int64_t) RE, stream_);
+        // the experts' weighted sum, its convolution, into the residual
+        ik::ConvJob mj;
+        mj.w = F(l, "ffn_post_conv.weight");
+        mj.out = diag() ? mc_ : nullptr;
+        mj.ch0 = 2 * nkv + E;
+        mj.C = E;
+        mj.scale = post_scale;
+        ik::conv_residual(mj, eout_, rw_, g_.n_used, kHead, ring, d_pos_, R, keep, cur_, nullptr, stream_);
         if (diag()) dump("l_out-" + std::to_string(s), cur_, (int64_t) RE);
     }
 
@@ -461,8 +474,8 @@ private:
         if (head > 0) {   // the output: the states mixed by its own query, normed, the head and the cap, for the last `head` rows
             ik::depth_mix(states(blocks, cur_), (const float*) m_.tensor("output_res_query.weight")->ptr, 1, R, E, kMixEps, fx_, stream_);
             const float* last = fx_ + (size_t) (R - head) * E;
-            bk::rms_norm_rows(last, (const float*) m_.tensor("output_norm.weight")->ptr, hn_, head, E, g_.rms_eps, stream_);
-            quant(hn_, head, E, hq_);
+            const ik::NormJob hj{last, (const float*) m_.tensor("output_norm.weight")->ptr};
+            ik::norm_quant(&hj, 1, head, E, g_.rms_eps, hn_, hq_, stream_);
             gemv(m_.tensor("output.weight"), hq_, hl_, E, g_.vocab_padded, head);
             ik::cap_logits(hl_, g_.vocab_padded, head, g_.n_vocab, g_.logit_cap, logits_, stream_);
         }
@@ -509,7 +522,7 @@ private:
     void *xq_ = nullptr, *attq_ = nullptr, *fxq_ = nullptr, *hq_ = nullptr, *escr_ = nullptr, *ws_ = nullptr;
     float *q_ = nullptr, *kraw_ = nullptr, *vraw_ = nullptr, *k_ = nullptr, *v_ = nullptr, *r_ = nullptr, *sink_ = nullptr, *gate_ = nullptr,
           *dk_ = nullptr, *dv_ = nullptr, *att_ = nullptr, *o_ = nullptr, *oc_ = nullptr, *fx_ = nullptr, *fc_ = nullptr, *fn_ = nullptr,
-          *rlog_ = nullptr, *rw_ = nullptr, *eout_ = nullptr, *moe_ = nullptr, *mc_ = nullptr, *ctlg_ = nullptr, *hn_ = nullptr, *hl_ = nullptr,
+          *rlog_ = nullptr, *rw_ = nullptr, *eout_ = nullptr, *mc_ = nullptr, *ctlg_ = nullptr, *hn_ = nullptr, *hl_ = nullptr,
           *logits_ = nullptr;
     int32_t *ids_ = nullptr, *grp_start_ = nullptr, *n_groups_ = nullptr, *ent_dst_ = nullptr, *ent_tok_ = nullptr, *pick_ = nullptr;
     unsigned long long* grp_ptr_ = nullptr;

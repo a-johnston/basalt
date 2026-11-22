@@ -1,6 +1,8 @@
-// src/models/inkling2x/kernels/ops.cu - Inkling 2's row kernels: the depth mix, the loop controllers, the short
-// convolutions, the attention's input preparation, the routed experts' grouping and sum, and the capped logits.
+// src/models/inkling2x/kernels/ops.cu - Inkling 2's row kernels: the depth mix, the norms with their q8_1 blocks, the loop
+// controllers, the short convolutions (with the residual and the routed experts' sum), the attention's input
+// preparation, the routed experts' grouping, and the capped logits.
 #include "basalt/models/inkling2x/kernels.hpp"
+#include "q8_1.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -90,19 +92,61 @@ __global__ void __launch_bounds__(kMixThreads) depth_mix_kernel(States s, const 
     }
 }
 
+// ------------------------------------------------------------------------------------------------ norms and q8_1
+// dense_ops' block sum: the warps' sums added in order by every thread
+__device__ __forceinline__ float block_sum_ordered(float v, float* red) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    v = warp_sum(v);
+    __syncthreads();
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    float t = 0.0f;
+    for (int i = 0; i < nw; ++i) t += red[i];
+    return t;
+}
+
+constexpr int kNormThreads = 512;   // rms_norm_rows's block
+struct NormJobs {
+    NormJob j[3];
+};
+
+// rms_norm_rows_kernel's arithmetic, then each warp's 32 values (n_embd a multiple of 32) quantized as
+// quantize_q8_1_rows does.  Grid (rows, jobs).
+__global__ void __launch_bounds__(kNormThreads) norm_quant_kernel(NormJobs a, int rows, int E, float eps, float* __restrict__ out,
+                                                                  Q81* __restrict__ xq) {
+    __shared__ float red[32];
+    const int r = blockIdx.x, j = blockIdx.y;
+    const float* xr = a.j[j].x + (size_t) r * E;
+    const float* w = a.j[j].w;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < E; c += kNormThreads) ss = fmaf(xr[c], xr[c], ss);
+    const float inv = rsqrtf(block_sum_ordered(ss, red) / (float) E + eps);
+    float* yr = out + ((size_t) j * rows + r) * E;
+    Q81* qr = xq ? xq + ((size_t) j * rows + r) * (E / 32) : nullptr;
+    for (int c = threadIdx.x; c < E; c += kNormThreads) {
+        const float v = xr[c] * inv * w[c];
+        yr[c] = v;
+        if (qr) q8_1_value(v, qr, c);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- loop controllers
 // g[r][o] = D[o] . [rms(cur); rms(msg)]: a block per output and row, the norms' sums taken in the same pass as the products
-// (the norm is a factor of each half: g = (D_a . a) inv_a + (D_b . b) inv_b)
+// (the norm is a factor of each half: g = (D_a . a) inv_a + (D_b . b) inv_b).  blockIdx.z: the controller.
 constexpr int kCtlThreads = 256;
+struct CtlJobs {
+    CtlJob j[3];
+};
 
-__global__ void __launch_bounds__(kCtlThreads) control_down_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
-                                                                   const float* __restrict__ D, int E, int rank, float eps,
-                                                                   float* __restrict__ g) {
+__global__ void __launch_bounds__(kCtlThreads) control_down_kernel(CtlJobs jobs, int rows, int E, int rank, float eps,
+                                                                   float* __restrict__ g_all) {
     const int o = blockIdx.x, r = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     __shared__ float part[kCtlThreads / 32][4];
-    const float* a = cur + (size_t) r * E;
-    const float* b = msg + (size_t) r * E;
-    const float* w = D + (size_t) o * 2 * E;
+    const CtlJob& jb = jobs.j[blockIdx.z];
+    float* g = g_all + (size_t) blockIdx.z * rows * rank;
+    const float* a = jb.cur + (size_t) r * E;
+    const float* b = jb.msg + (size_t) r * E;
+    const float* w = jb.down + (size_t) o * 2 * E;
     float sa = 0.0f, sb = 0.0f, da = 0.0f, db = 0.0f;
     for (int e = threadIdx.x; e < E; e += kCtlThreads) {
         const float av = a[e], bv = b[e];
@@ -131,12 +175,13 @@ __global__ void __launch_bounds__(kCtlThreads) control_down_kernel(const float* 
 }
 
 // out[r][e] = cur - tanh(F[e] . g) cur + tanh(G[e] . g) msg: a warp per value, its lanes over the rank (G and F rows contiguous)
-__global__ void __launch_bounds__(kCtlThreads) control_out_kernel(const float* __restrict__ cur, const float* __restrict__ msg,
-                                                                  const float* __restrict__ G, const float* __restrict__ F,
-                                                                  const float* __restrict__ g, int E, int rank, float* __restrict__ out) {
+__global__ void __launch_bounds__(kCtlThreads) control_out_kernel(CtlJobs jobs, int rows, int E, int rank, const float* __restrict__ g_all) {
     const int r = blockIdx.y, lane = threadIdx.x & 31, e = blockIdx.x * (kCtlThreads / 32) + (threadIdx.x >> 5);
     if (e >= E) return;
-    const float* gr = g + (size_t) r * rank;
+    const CtlJob& jb = jobs.j[blockIdx.z];
+    const float *cur = jb.cur, *msg = jb.msg, *G = jb.gain, *F = jb.forget;
+    float* out = jb.out;
+    const float* gr = g_all + ((size_t) blockIdx.z * rows + r) * rank;
     float ga = 0.0f, fo = 0.0f;
     for (int i = lane; i < rank; i += 32) {
         const float gi = gr[i];
@@ -154,34 +199,65 @@ __global__ void __launch_bounds__(kCtlThreads) control_out_kernel(const float* _
 // ----------------------------------------------------------------------------------------------- short convolutions
 __global__ void set_position_kernel(int64_t* pos, long long value) { *pos = value; }
 
-__global__ void short_conv_kernel(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ dyn, int hw,
-                                  int n_dyn, ConvRing ring, int ch0, const int64_t* __restrict__ pos, int C, float scale,
-                                  float* __restrict__ out) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
-    if (c >= C) return;
+// A thread a channel (of job a's channels, then b's) through every row in order: the three inputs before the first row
+// from the ring, each row's input kept for the next, and the last `keep` rows' inputs written back.  A channel's ring
+// cells are its thread's alone, so the reads and the writes need no ordering across threads.  The arithmetic is the
+// separate kernels' it replaces (the convolution, the experts' sum, the residual add): the same bits.
+constexpr int kConvThreads = 64;
+template<bool SUM, bool RESID>
+__global__ void __launch_bounds__(kConvThreads) conv_rows_kernel(ConvJob a, ConvJob b, int hw, ConvRing ring, const int64_t* __restrict__ pos,
+                                                                 int rows, int keep, const float* __restrict__ eout,
+                                                                 const float* __restrict__ ew, int k, float* cur, float* save) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool second = c >= a.C;
+    const ConvJob& j = second ? b : a;
+    if (second) c -= a.C;
+    if (c >= j.C) return;
     const long long pos0 = *pos;
-    float xv[4];   // x_(t-3) .. x_t
-    for (int k = 0; k < 4; ++k) {
-        const int rr = r - k;
-        const long long p = pos0 + rr;
-        xv[3 - k] = rr >= 0 ? x[(size_t) rr * C + c]
-                  : p >= 0  ? ring.data[(size_t) (p % ring.slots) * ring.width + ch0 + c]
-                            : 0.0f;
+    const int C = j.C, n_dyn = j.dyn ? C / hw * 4 : 0;
+    float h[3];   // x_(t-3), x_(t-2), x_(t-1)
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const long long p = pos0 - 3 + i;
+        h[i] = p >= 0 ? ring.data[(size_t) (p % ring.slots) * ring.width + j.ch0 + c] : 0.0f;
     }
-    float acc = 0.0f;
-    for (int i = 0; i < 4; ++i) acc += xv[i] * w[(size_t) c * 4 + i];
-    if (dyn) {
-        const float* tap = dyn + (size_t) r * n_dyn + (size_t) (c / hw) * 4;
-        for (int lag = 0; lag < 4; ++lag) acc = acc + xv[3 - lag] * tap[lag];
+    float w4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) w4[i] = j.w[(size_t) c * 4 + i];
+    for (int r = 0; r < rows; ++r) {
+        float xt;
+        if constexpr (SUM) {
+            float acc = 0.0f;
+            for (int q = 0; q < k; ++q) acc = acc + eout[((size_t) r * k + q) * C + c] * ew[(size_t) r * k + q];
+            xt = acc;
+        } else {
+            xt = j.x[(size_t) r * C + c];
+        }
+        const float xv[4] = {h[0], h[1], h[2], xt};
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc += xv[i] * w4[i];
+        if (j.dyn) {
+            const float* tap = j.dyn + (size_t) r * n_dyn + (size_t) (c / hw) * 4;
+#pragma unroll
+            for (int lag = 0; lag < 4; ++lag) acc = acc + xv[3 - lag] * tap[lag];
+        }
+        const float o = (xv[3] + acc) * j.scale;
+        if (j.out) j.out[(size_t) r * C + c] = o;
+        if constexpr (RESID) {
+            const size_t at = (size_t) r * C + c;
+            if (save) {
+                save[at] = cur[at];
+                cur[at] = o;
+            } else {
+                cur[at] += o;
+            }
+        }
+        if (r >= rows - keep) ring.data[(size_t) ((pos0 + r) % ring.slots) * ring.width + j.ch0 + c] = xt;
+        h[0] = h[1];
+        h[1] = h[2];
+        h[2] = xt;
     }
-    out[(size_t) r * C + c] = (xv[3] + acc) * scale;
-}
-
-__global__ void conv_store_kernel(const float* __restrict__ x, ConvRing ring, int ch0, const int64_t* __restrict__ pos, int r0, int C) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x, r = r0 + blockIdx.y;
-    if (c >= C) return;
-    const long long pos0 = *pos;
-    ring.data[(size_t) ((pos0 + r) % ring.slots) * ring.width + ch0 + c] = x[(size_t) r * C + c];
 }
 
 // ------------------------------------------------------------------------------------------ the attention's inputs
@@ -274,14 +350,6 @@ __global__ void group_experts_kernel(const int32_t* __restrict__ ids, int n, int
     }
 }
 
-__global__ void sum_experts_kernel(const float* __restrict__ out, const float* __restrict__ w, int k, int E, float* __restrict__ y) {
-    const int r = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= E) return;
-    float acc = 0.0f;
-    for (int j = 0; j < k; ++j) acc = acc + out[((size_t) r * k + j) * E + e] * w[(size_t) r * k + j];
-    y[(size_t) r * E + e] = acc;
-}
-
 __global__ void cap_logits_kernel(const float* __restrict__ x, int ld, int n_vocab, float cap, float* __restrict__ y) {
     const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_vocab) return;
@@ -304,27 +372,46 @@ void depth_mix(const States& s, const float* queries, int nq, int rows, int n_em
         s, queries, rows, n_embd, eps, slice, out);
 }
 
-void loop_control(const float* cur, const float* msg, const float* down, const float* gain, const float* forget, int rows, int n_embd,
-                  int rank, float eps, float* g, float* out, void* stream) {
-    if (rows <= 0) return;
+void norm_quant(const NormJob* jobs, int n, int rows, int n_embd, float eps, float* out, void* xq, void* stream) {
+    if (rows <= 0 || n <= 0) return;
+    NormJobs a{};
+    for (int i = 0; i < n && i < 3; ++i) a.j[i] = jobs[i];
+    norm_quant_kernel<<<dim3((unsigned) rows, (unsigned) std::min(n, 3)), kNormThreads, 0, (cudaStream_t) stream>>>(
+        a, rows, n_embd, eps, out, (Q81*) xq);
+}
+
+void loop_control(const CtlJob* jobs, int n, int rows, int n_embd, int rank, float eps, float* g, void* stream) {
+    if (rows <= 0 || n <= 0) return;
+    CtlJobs a{};
+    for (int i = 0; i < n && i < 3; ++i) a.j[i] = jobs[i];
+    const unsigned nz = (unsigned) std::min(n, 3);
     cudaStream_t st = (cudaStream_t) stream;
-    control_down_kernel<<<dim3((unsigned) rank, (unsigned) rows), kCtlThreads, 0, st>>>(cur, msg, down, n_embd, rank, eps, g);
-    control_out_kernel<<<dim3((unsigned) ((n_embd + kCtlThreads / 32 - 1) / (kCtlThreads / 32)), (unsigned) rows), kCtlThreads, 0, st>>>(
-        cur, msg, gain, forget, g, n_embd, rank, out);
+    control_down_kernel<<<dim3((unsigned) rank, (unsigned) rows, nz), kCtlThreads, 0, st>>>(a, rows, n_embd, rank, eps, g);
+    control_out_kernel<<<dim3((unsigned) ((n_embd + kCtlThreads / 32 - 1) / (kCtlThreads / 32)), (unsigned) rows, nz), kCtlThreads, 0, st>>>(
+        a, rows, n_embd, rank, g);
 }
 
-void short_conv(const float* x, const float* w, const float* dyn, int head_width, const ConvRing& ring, int ch0, const int64_t* pos,
-                int rows, int C, float scale, float* out, void* stream) {
+void conv_rows(const ConvJob& a, const ConvJob* b, int head_width, const ConvRing& ring, const int64_t* pos, int rows, int keep,
+               void* stream) {
     if (rows <= 0) return;
-    const int n_dyn = dyn ? C / head_width * 4 : 0;
-    short_conv_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
-        x, w, dyn, head_width, n_dyn, ring, ch0, pos, C, scale, out);
+    const ConvJob none;
+    const int C = a.C + (b ? b->C : 0);
+    conv_rows_kernel<false, false><<<(unsigned) ((C + kConvThreads - 1) / kConvThreads), kConvThreads, 0, (cudaStream_t) stream>>>(
+        a, b ? *b : none, head_width, ring, pos, rows, std::min(keep, rows), nullptr, nullptr, 0, nullptr, nullptr);
 }
 
-void conv_store(const float* x, const ConvRing& ring, int ch0, const int64_t* pos, int rows, int keep, int C, void* stream) {
-    const int n = keep < rows ? keep : rows;
-    if (n <= 0) return;
-    conv_store_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) n), 256, 0, (cudaStream_t) stream>>>(x, ring, ch0, pos, rows - n, C);
+void conv_residual(const ConvJob& a, const float* eout, const float* ew, int k, int head_width, const ConvRing& ring,
+                   const int64_t* pos, int rows, int keep, float* cur, float* save, void* stream) {
+    if (rows <= 0) return;
+    const ConvJob none;
+    const dim3 grid((unsigned) ((a.C + kConvThreads - 1) / kConvThreads));
+    cudaStream_t st = (cudaStream_t) stream;
+    if (eout)
+        conv_rows_kernel<true, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, pos, rows, std::min(keep, rows), eout, ew,
+                                                                     k, cur, save);
+    else
+        conv_rows_kernel<false, true><<<grid, kConvThreads, 0, st>>>(a, none, head_width, ring, pos, rows, std::min(keep, rows), nullptr,
+                                                                      nullptr, 0, cur, save);
 }
 
 void qkvr_prep(float* q, const float* k, const float* v, float* r, const float* q_scale, const float* r_scale, const PrepArgs& a,
@@ -339,11 +426,6 @@ void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsi
                    void* stream) {
     group_experts_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, (cudaStream_t) stream>>>(
         ids, rows * k, n_expert, expert_ptr, expert_rates, grp_ptr, grp_rates, grp_start, n_groups, ent_dst, ent_tok, k);
-}
-
-void sum_experts(const float* out, const float* w, int rows, int k, int n_embd, float* y, void* stream) {
-    if (rows <= 0) return;
-    sum_experts_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(out, w, k, n_embd, y);
 }
 
 void cap_logits(const float* x, int ld, int rows, int n_vocab, float cap, float* logits, void* stream) {

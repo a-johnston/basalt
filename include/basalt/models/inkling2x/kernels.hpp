@@ -1,6 +1,7 @@
-// basalt/models/inkling2x/kernels.hpp - Inkling 2's own kernels: the depth mix, the loop controllers, the short
-// convolutions, the attention's Q/K/V/R preparation and its attention with a relative-position bias and a sink, the
-// routed experts' grouping and sum, and the capped logits. Rows are tokens; every [rows][width] buffer is row-major.
+// basalt/models/inkling2x/kernels.hpp - Inkling 2's own kernels: the depth mix, the norms with their q8_1 blocks, the loop
+// controllers, the short convolutions (with the residual and the routed experts' sum), the attention's Q/K/V/R
+// preparation and its attention with a relative-position bias and a sink, the routed experts' grouping, and the capped
+// logits. Rows are tokens; every [rows][width] buffer is row-major.
 // The kernels that depend on the rows' positions read the first row's from `pos`, a device word (set_position), so a
 // captured graph replays at a new position.
 #pragma once
@@ -25,10 +26,23 @@ void set_position(int64_t* pos, int64_t value, void* stream);
 /// with 1/sqrt(n_embd), the softmax over the states, and their normed values summed by it into out[q][row][n_embd].
 void depth_mix(const States& s, const float* queries, int nq, int rows, int n_embd, float eps, float* out, void* stream);
 
-/// A loop controller: out = cur - tanh(F g) * cur + tanh(G g) * msg with g = D [rms(cur); rms(msg)] (the norms without a
-/// weight, `eps`). D is [rank][2 n_embd], G (gain) and F (forget) [n_embd][rank], all F32. `g` is [rows][rank] scratch.
-void loop_control(const float* cur, const float* msg, const float* down, const float* gain, const float* forget, int rows,
-                  int n_embd, int rank, float eps, float* g, float* out, void* stream);
+/// RMS norms with their weights, out[j][row] = x_j[row] * rsqrt(mean(x_j[row]^2) + eps) * w_j, and their q8_1 blocks
+/// xq[j][row] (null: none), for up to 3 inputs of [rows][n_embd] in one launch: rms_norm_rows's and quantize_q8_1_rows's
+/// arithmetic, the same bits.
+struct NormJob {
+    const float* x = nullptr;
+    const float* w = nullptr;
+};
+void norm_quant(const NormJob* jobs, int n, int rows, int n_embd, float eps, float* out, void* xq, void* stream);
+
+/// Loop controllers: out = cur - tanh(F g) * cur + tanh(G g) * msg with g = D [rms(cur); rms(msg)] (the norms without a
+/// weight, `eps`). D is [rank][2 n_embd], G (gain) and F (forget) [n_embd][rank], all F32. Up to 3 controllers in one
+/// launch a phase; `g` is [n][rows][rank] scratch.
+struct CtlJob {
+    const float *cur = nullptr, *msg = nullptr, *down = nullptr, *gain = nullptr, *forget = nullptr;
+    float* out = nullptr;
+};
+void loop_control(const CtlJob* jobs, int n, int rows, int n_embd, int rank, float eps, float* g, void* stream);
 
 /// The last inputs of a layer slot's convolutions by position: `slots` rows of `width` floats, position p in row p % slots.
 struct ConvRing {
@@ -39,11 +53,25 @@ struct ConvRing {
 
 /// A causal short convolution of 4 taps with its residual, over rows at positions *pos..: out = (x_t + sum_i w[c][i] x_(t-3+i)
 /// + sum_lag dyn[t][h(c) 4 + lag] x_(t-lag)) * scale, h(c) = c / head_width. Inputs before *pos come from the ring's channels
-/// [ch0, ch0 + C) (zero before position 0). `dyn` (null: none) is [rows][C / head_width * 4].
-void short_conv(const float* x, const float* w, const float* dyn, int head_width, const ConvRing& ring, int ch0, const int64_t* pos,
-                int rows, int C, float scale, float* out, void* stream);
-/// The ring keeps the inputs of rows [rows - keep, rows) (keep at most ring.slots - 3) at their positions.
-void conv_store(const float* x, const ConvRing& ring, int ch0, const int64_t* pos, int rows, int keep, int C, void* stream);
+/// [ch0, ch0 + C) (zero before position 0), and the ring keeps the inputs of rows [rows - keep, rows) (keep at most
+/// ring.slots - 3) at their positions. `dyn` (null: none) is [rows][C / head_width * 4]; `out` [rows][C] (null: not written).
+/// A thread takes a channel through every row in order, so its ring cells are its own and any number of rows is one launch.
+struct ConvJob {
+    const float* x = nullptr;
+    const float* w = nullptr;
+    const float* dyn = nullptr;
+    float* out = nullptr;
+    int ch0 = 0, C = 0;
+    float scale = 1.0f;
+};
+/// One or two convolutions (`b` null: one) in one launch.
+void conv_rows(const ConvJob& a, const ConvJob* b, int head_width, const ConvRing& ring, const int64_t* pos, int rows, int keep,
+               void* stream);
+/// One convolution whose result is the residual: added to cur ([rows][C]), or, with `save` set (a block's first layer),
+/// cur copied to save and replaced. With `eout` set its input is the routed experts' sum, x[row] = sum_j ew[row][j]
+/// eout[row k + j] in j order (a.x unused).
+void conv_residual(const ConvJob& a, const float* eout, const float* ew, int k, int head_width, const ConvRing& ring,
+                   const int64_t* pos, int rows, int keep, float* cur, float* save, void* stream);
 
 /// The attention's inputs of rows at positions *pos..: Q ([rows][n_head][128]) scaled by q_scale ([n_head][128]) and clipped
 /// to an L2 norm of qk_clip, K ([rows][n_kv][128]) clipped to qk_clip, V RMS-normed (no weight, eps), R ([rows][n_head][16])
@@ -69,9 +97,10 @@ struct AttnArgs {
     int64_t cells = 0;   ///< the caches' cells: position p in cell p % cells
 };
 size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys);
+/// `out_q8_1` (null: none) gets out's q8_1 blocks as quantize_q8_1_rows would make them.
 void attention(const float* q, const float* r, const float* sinks, const float* gate, const float* rel_bias,
                const uint16_t* k_cache, const uint16_t* v_cache, const AttnArgs& a, const int64_t* pos, int64_t pos0, int rows,
-               void* ws, float* out, void* stream);
+               void* ws, float* out, void* out_q8_1, void* stream);
 /// The split count of a launch of `rows` rows whose last is at p_last: equal counts can share a captured launch.
 int attention_splits(const AttnArgs& a, int64_t p_last, int rows);
 
@@ -82,8 +111,6 @@ using ::basalt::kernels::Exl3Rates;
 void group_experts(const int32_t* ids, int rows, int k, int n_expert, const unsigned long long* expert_ptr,
                    const Exl3Rates* expert_rates, unsigned long long* grp_ptr, Exl3Rates* grp_rates, int32_t* grp_start,
                    int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok, void* stream);
-/// y[row] = sum_j w[row][j] out[row k + j], j in order.
-void sum_experts(const float* out, const float* w, int rows, int k, int n_embd, float* y, void* stream);
 
 /// logits[row][i] = cap tanh(x[row][i] / cap) for i < n_vocab of rows of `ld` values.
 void cap_logits(const float* x, int ld, int rows, int n_vocab, float cap, float* logits, void* stream);

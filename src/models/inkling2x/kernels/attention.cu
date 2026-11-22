@@ -4,6 +4,7 @@
 // a warp takes four keys at a time, eight lanes a key with 16 of its values each. A second kernel joins the splits.
 #include "basalt/models/inkling2x/kernels.hpp"
 #include "basalt/log.hpp"
+#include "q8_1.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -169,8 +170,9 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(const float* __
     }
 }
 
+// out, and with xq set its q8_1 blocks (a head's 128 values are four blocks, a warp each)
 __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __restrict__ gate, int n_head, int rows, int nsplit,
-                                 float* __restrict__ out) {
+                                 float* __restrict__ out, Q81* __restrict__ xq) {
     const int row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const size_t base = ((size_t) row * n_head + h) * nsplit;
     const float* wsm = ws, *wsl = ws + (size_t) rows * n_head * nsplit, *wsa = ws + 2 * (size_t) rows * n_head * nsplit;
@@ -184,7 +186,9 @@ __global__ void attn_join_kernel(const float* __restrict__ ws, const float* __re
         o += wsa[(base + s) * kHead + d] * c;
     }
     const size_t at = ((size_t) row * n_head + h) * kHead + d;
-    out[at] = (o / l) * (1.0f / (1.0f + expf(-gate[at])));
+    const float v = (o / l) * (1.0f / (1.0f + expf(-gate[at])));
+    out[at] = v;
+    if (xq) q8_1_value(v, xq, (long long) at);
 }
 
 int split_of(int rows) { return rows <= kDecodeRows ? kSplitDecode : kSplitPrompt; }
@@ -203,7 +207,7 @@ size_t attention_workspace_bytes(int rows, int n_head, int64_t max_keys) {
 
 void attention(const float* q, const float* r, const float* sinks, const float* gate, const float* rel_bias, const uint16_t* k_cache,
                const uint16_t* v_cache, const AttnArgs& a, const int64_t* pos, int64_t pos0, int rows, void* ws, float* out,
-               void* stream) {
+               void* out_q8_1, void* stream) {
     if (rows <= 0) return;
     const int split = split_of(rows), nsplit = attention_splits(a, pos0 + rows - 1, rows);
     cudaStream_t st = (cudaStream_t) stream;
@@ -215,7 +219,8 @@ void attention(const float* q, const float* r, const float* sinks, const float* 
 #undef X
         default: basalt::log::error("basalt inkling2x", "attention: %d query heads a K/V head", a.n_head / a.n_kv); std::exit(1);
     }
-    attn_join_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head), kHead, 0, st>>>((const float*) ws, gate, a.n_head, rows, nsplit, out);
+    attn_join_kernel<<<dim3((unsigned) rows, (unsigned) a.n_head), kHead, 0, st>>>((const float*) ws, gate, a.n_head, rows, nsplit, out,
+                                                                                (Q81*) out_q8_1);
 }
 
 }  // namespace basalt::models::inkling2x::kernels

@@ -1,10 +1,12 @@
 // src/models/inkling2x/kernels_parity.cpp - Inkling 2's kernels against plain CPU references in double, at the model's
-// geometry: the depth mix, a loop controller, the short convolutions and their ring, the attention's inputs, the
-// attention (a sliding layer past its window and a full layer past the bias extent), the routed experts with situ
+// geometry: the depth mix, the norms with their q8_1 blocks, the loop controllers, the short convolutions with their ring,
+// the residual and the experts' sum, the attention's inputs, the attention (a sliding layer past its window and a full
+// layer past the bias extent, with its q8_1 blocks), the routed experts with situ
 // through native_expert_grouped (IQ3_XXS gate/up and IQ4_NL down, dequantized by ggml; EXL3 at 2.5 and 3 bpw, decoded by
 // the CPU reference) and the logits.
 // A row's result must not depend on the rows beside it: each check also runs its first row alone.
 #include "basalt/ggml/ggml.h"
+#include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/cpu/exl3_cpu.hpp"
 #include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -140,85 +142,211 @@ void check_mix() {
     same("depth mix", g1.data(), row0.data(), row0.size());
 }
 
-// ---------------------------------------------------------------------------------------------------- loop controller
-void check_control() {
-    const int R = 3;
-    auto ch = randn((size_t) R * E), mh = randn((size_t) R * E, 2.0f);
-    auto dh = randn((size_t) RANK * 2 * E, 0.02f), gh = randn((size_t) E * RANK, 0.1f), fh = randn((size_t) E * RANK, 0.1f);
-    float *c = up(ch), *m = up(mh), *dw = up(dh), *gw = up(gh), *fw = up(fh);
-    float* g = zeros<float>((size_t) R * RANK);
-    float* out = zeros<float>((size_t) R * E);
-    k::loop_control(c, m, dw, gw, fw, R, E, RANK, 1e-6f, g, out, nullptr);
-    std::vector<double> ref((size_t) R * E);
-    for (int r = 0; r < R; ++r) {
-        auto a = rmsn(ch.data() + (size_t) r * E, E, 1e-6), b = rmsn(mh.data() + (size_t) r * E, E, 1e-6);
-        std::vector<double> gg(RANK);
-        for (int o = 0; o < RANK; ++o) {
-            double acc = 0;
-            for (int e = 0; e < E; ++e) acc += dh[(size_t) o * 2 * E + e] * a[e] + dh[(size_t) o * 2 * E + E + e] * b[e];
-            gg[o] = acc;
-        }
-        for (int e = 0; e < E; ++e) {
-            double ga = 0, fo = 0;
-            for (int o = 0; o < RANK; ++o) {
-                ga += gh[(size_t) e * RANK + o] * gg[o];
-                fo += fh[(size_t) e * RANK + o] * gg[o];
-            }
-            const double cv = ch[(size_t) r * E + e], mv = mh[(size_t) r * E + e];
-            ref[(size_t) r * E + e] = cv - std::tanh(fo) * cv + std::tanh(ga) * mv;
-        }
+// ---------------------------------------------------------------------------------------------- norms and q8_1
+void check_norm_quant() {
+    const int R = 5, NJ = 3;
+    std::vector<std::vector<float>> xh(NJ), wh(NJ);
+    k::NormJob jobs[NJ];
+    for (int j = 0; j < NJ; ++j) {
+        xh[j] = randn((size_t) R * E, 1.0f + j);
+        wh[j] = randn(E, 0.5f);
+        jobs[j] = {up(xh[j]), up(wh[j])};
     }
+    const size_t q8 = (size_t) E / 32 * 36;
+    float* out = zeros<float>((size_t) NJ * R * E);
+    uint8_t* xq = zeros<uint8_t>((size_t) NJ * R * q8);
+    k::norm_quant(jobs, NJ, R, E, 1e-6f, out, xq, nullptr);
+    std::vector<double> ref((size_t) NJ * R * E);
+    for (int j = 0; j < NJ; ++j)
+        for (int r = 0; r < R; ++r) {
+            const auto n = rmsn(xh[j].data() + (size_t) r * E, E, 1e-6);
+            for (int c = 0; c < E; ++c) ref[((size_t) j * R + r) * E + c] = n[c] * wh[j][c];
+        }
     const auto got = down(out, ref.size());
-    report("loop controller", got, ref, 1e-5);
-    float* one = zeros<float>(E);
-    k::loop_control(c, m, dw, gw, fw, 1, E, RANK, 1e-6f, g, one, nullptr);
-    same("loop controller", down(one, E).data(), got.data(), E);
+    report("norms (3 inputs)", got, ref, 1e-6);
+    // the same bits as rms_norm_rows and quantize_q8_1_rows
+    float* n1 = zeros<float>((size_t) R * E);
+    uint8_t* q1 = zeros<uint8_t>((size_t) R * q8);
+    bool ok = true;
+    for (int j = 0; j < NJ; ++j) {
+        bk::rms_norm_rows(jobs[j].x, jobs[j].w, n1, R, E, 1e-6f, nullptr);
+        bk::quantize_q8_1_rows(n1, R, E, q1, nullptr);
+        ok &= down(n1, (size_t) R * E) == std::vector<float>(got.begin() + (size_t) j * R * E, got.begin() + (size_t) (j + 1) * R * E);
+        const auto a = down(q1, (size_t) R * q8), b = down(xq + (size_t) j * R * q8, (size_t) R * q8);
+        ok &= a == b;
+    }
+    std::printf("%-34s %s\n", "norms and q8_1 vs separate kernels", ok ? "bit for bit" : "FAIL");
+    failures += !ok;
+}
+
+// ---------------------------------------------------------------------------------------------------- loop controllers
+void check_control() {
+    const int R = 3, NJ = 3;
+    auto dh = randn((size_t) RANK * 2 * E, 0.02f), gh = randn((size_t) E * RANK, 0.1f), fh = randn((size_t) E * RANK, 0.1f);
+    float *dw = up(dh), *gw = up(gh), *fw = up(fh);
+    float* g = zeros<float>((size_t) NJ * R * RANK);
+    std::vector<std::vector<float>> ch(NJ), mh(NJ);
+    k::CtlJob jobs[NJ];
+    for (int j = 0; j < NJ; ++j) {
+        ch[j] = randn((size_t) R * E, 1.0f + j);
+        mh[j] = randn((size_t) R * E, 2.0f);
+        jobs[j] = {up(ch[j]), up(mh[j]), dw, gw, fw, zeros<float>((size_t) R * E)};
+    }
+    k::loop_control(jobs, NJ, R, E, RANK, 1e-6f, g, nullptr);
+    std::vector<double> ref((size_t) NJ * R * E);
+    for (int j = 0; j < NJ; ++j)
+        for (int r = 0; r < R; ++r) {
+            auto a = rmsn(ch[j].data() + (size_t) r * E, E, 1e-6), b = rmsn(mh[j].data() + (size_t) r * E, E, 1e-6);
+            std::vector<double> gg(RANK);
+            for (int o = 0; o < RANK; ++o) {
+                double acc = 0;
+                for (int e = 0; e < E; ++e) acc += dh[(size_t) o * 2 * E + e] * a[e] + dh[(size_t) o * 2 * E + E + e] * b[e];
+                gg[o] = acc;
+            }
+            for (int e = 0; e < E; ++e) {
+                double ga = 0, fo = 0;
+                for (int o = 0; o < RANK; ++o) {
+                    ga += gh[(size_t) e * RANK + o] * gg[o];
+                    fo += fh[(size_t) e * RANK + o] * gg[o];
+                }
+                const double cv = ch[j][(size_t) r * E + e], mv = mh[j][(size_t) r * E + e];
+                ref[((size_t) j * R + r) * E + e] = cv - std::tanh(fo) * cv + std::tanh(ga) * mv;
+            }
+        }
+    std::vector<float> got;
+    for (int j = 0; j < NJ; ++j) {
+        const auto o = down(jobs[j].out, (size_t) R * E);
+        got.insert(got.end(), o.begin(), o.end());
+    }
+    report("loop controllers (3 a launch)", got, ref, 1e-5);
+    // each alone, and its first row alone: the same bits
+    bool ok = true;
+    for (int j = 0; j < NJ; ++j) {
+        k::CtlJob one = jobs[j];
+        one.out = zeros<float>((size_t) R * E);
+        k::loop_control(&one, 1, R, E, RANK, 1e-6f, g, nullptr);
+        ok &= std::memcmp(down(one.out, (size_t) R * E).data(), got.data() + (size_t) j * R * E, (size_t) R * E * 4) == 0;
+    }
+    std::printf("%-34s %s\n", "loop controllers", ok ? "each alone: bit for bit" : "FAIL: alone differs");
+    failures += !ok;
+    k::CtlJob row = jobs[0];
+    row.out = zeros<float>(E);
+    k::loop_control(&row, 1, 1, E, RANK, 1e-6f, g, nullptr);
+    same("loop controller", down(row.out, E).data(), got.data(), E);
 }
 
 // ----------------------------------------------------------------------------------------------- short convolutions
+// the reference of one job's channel c at row r: the inputs before the first row from the ring (zero before position 0)
+// y[row] = sum_j w[row][j] eo[row k + j] in j order, on the host, into the device buffer y (the session's sum is inside its
+// convolution kernel, checked there)
+void sum_experts_host(const float* eo, const float* w, int rows, float* y) {
+    const auto o = down(eo, (size_t) rows * KTOP * E);
+    std::vector<float> s((size_t) rows * E, 0.0f);
+    for (int r = 0; r < rows; ++r)
+        for (int j = 0; j < KTOP; ++j)
+            for (int c = 0; c < E; ++c) s[(size_t) r * E + c] += o[((size_t) r * KTOP + j) * E + c] * w[(size_t) r * KTOP + j];
+    cudaMemcpy(y, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+double conv_ref(const std::vector<float>& x, const std::vector<float>& w, const std::vector<float>* dyn, const std::vector<float>& ring,
+                int width, int slots, int ch0, int C, int64_t pos0, int r, int c, double scale) {
+    double xv[4];
+    for (int kk = 0; kk < 4; ++kk) {
+        const int rr = r - kk;
+        const int64_t p = pos0 + rr;
+        xv[3 - kk] = rr >= 0 ? x[(size_t) rr * C + c] : p >= 0 ? ring[(size_t) (p % slots) * width + ch0 + c] : 0.0;
+    }
+    double acc = 0;
+    for (int i = 0; i < 4; ++i) acc += xv[i] * w[(size_t) c * 4 + i];
+    if (dyn)
+        for (int lag = 0; lag < 4; ++lag) acc += xv[3 - lag] * (*dyn)[(size_t) r * (C / 128) * 4 + (c / 128) * 4 + lag];
+    return (xv[3] + acc) * scale;
+}
+
 void check_conv() {
-    const int R = 5, C = 1024, SLOTS = 32, WIDTH = 6656, CH0 = 1024, HW = 128;
-    const int64_t pos0 = 37;
-    auto xh = randn((size_t) R * C), wh = randn((size_t) C * 4, 0.3f), dyh = randn((size_t) R * (C / HW) * 4, 0.3f);
-    auto ringh = randn((size_t) SLOTS * WIDTH);
-    float *x = up(xh), *w = up(wh), *dy = up(dyh), *ringd = up(ringh), *out = zeros<float>((size_t) R * C);
-    k::ConvRing ring{ringd, SLOTS, WIDTH};
-    for (int dyn = 0; dyn < 2; ++dyn) {
-        const float scale = 1.0f / std::sqrt((float) ((dyn ? 2 : 1) * 4 + 1));
-        k::short_conv(x, w, dyn ? dy : nullptr, HW, ring, CH0, dpos(pos0), R, C, scale, out, nullptr);
-        std::vector<double> ref((size_t) R * C);
+    const int SLOTS = 32, WIDTH = 6656, HW = 128, CA = 1024, CB = 1024, CR = 2304;
+    for (int R : {5, 40}) {   // a decode window; a prompt run longer than the ring
+        const int64_t pos0 = 37;
+        const int keep = std::min(R, SLOTS - 3);
+        auto xa = randn((size_t) R * CA), xb = randn((size_t) R * CB), wa = randn((size_t) CA * 4, 0.3f), wb = randn((size_t) CB * 4, 0.3f);
+        auto dy = randn((size_t) R * (CA / HW) * 4, 0.3f), ringh = randn((size_t) SLOTS * WIDTH);
+        float* ringd = up(ringh);
+        const k::ConvRing ring{ringd, SLOTS, WIDTH};
+        k::ConvJob a{up(xa), up(wa), up(dy), zeros<float>((size_t) R * CA), 0, CA, 1.0f / std::sqrt(9.0f)};
+        k::ConvJob b{up(xb), up(wb), nullptr, zeros<float>((size_t) R * CB), CA, CB, 1.0f / std::sqrt(5.0f)};
+        k::conv_rows(a, &b, HW, ring, dpos(pos0), R, keep, nullptr);
+        std::vector<double> ref;
+        std::vector<float> got;
         for (int r = 0; r < R; ++r)
-            for (int c = 0; c < C; ++c) {
-                double xv[4];
-                for (int kk = 0; kk < 4; ++kk) {
-                    const int rr = r - kk;
-                    xv[3 - kk] = rr >= 0 ? xh[(size_t) rr * C + c] : ringh[(size_t) ((pos0 + rr) % SLOTS) * WIDTH + CH0 + c];
-                }
-                double acc = 0;
-                for (int i = 0; i < 4; ++i) acc += xv[i] * wh[(size_t) c * 4 + i];
-                if (dyn)
-                    for (int lag = 0; lag < 4; ++lag) acc += xv[3 - lag] * dyh[(size_t) r * (C / HW) * 4 + (c / HW) * 4 + lag];
-                ref[(size_t) r * C + c] = (xv[3] + acc) * scale;
-            }
-        report(dyn ? "short conv, input taps" : "short conv", down(out, ref.size()), ref, 1e-6);
+            for (int c = 0; c < CA; ++c) ref.push_back(conv_ref(xa, wa, &dy, ringh, WIDTH, SLOTS, 0, CA, pos0, r, c, a.scale));
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < CB; ++c) ref.push_back(conv_ref(xb, wb, nullptr, ringh, WIDTH, SLOTS, CA, CB, pos0, r, c, b.scale));
+        for (const k::ConvJob* jb : {&a, &b}) {
+            const auto o = down(jb->out, (size_t) R * jb->C);
+            got.insert(got.end(), o.begin(), o.end());
+        }
+        report(R == 5 ? "short convs, two jobs" : "short convs, 40 rows", got, ref, 1e-6);
+        // the ring: the last `keep` rows' inputs at their positions, the other cells as they were
+        const auto rg = down(ringd, ringh.size());
+        std::vector<float> want = ringh;
+        for (int r = R - keep; r < R; ++r)
+            for (int c = 0; c < CA + CB; ++c)
+                want[(size_t) ((pos0 + r) % SLOTS) * WIDTH + c] = c < CA ? xa[(size_t) r * CA + c] : xb[(size_t) r * CB + c - CA];
+        const bool ok = rg == want;
+        std::printf("%-34s %s\n", R == 5 ? "conv ring keeps the last rows" : "conv ring, 40 rows", ok ? "ok" : "FAIL");
+        failures += !ok;
+        if (R == 5) {   // its first row alone (the ring as before)
+            float* ring1 = up(ringh);
+            k::ConvJob a1 = a, b1 = b;
+            a1.out = zeros<float>(CA);
+            b1.out = zeros<float>(CB);
+            k::conv_rows(a1, &b1, HW, {ring1, SLOTS, WIDTH}, dpos(pos0), 1, 1, nullptr);
+            same("short convs", down(a1.out, CA).data(), got.data(), CA);
+        }
     }
     // position 1: the taps before position 0 are zero
-    float* o1 = zeros<float>(C);
-    k::short_conv(x, w, nullptr, HW, ring, CH0, dpos(1), 1, C, 1.0f, o1, nullptr);
-    std::vector<double> r1(C);
-    for (int c = 0; c < C; ++c)
-        r1[c] = xh[c] + xh[c] * wh[(size_t) c * 4 + 3] + ringh[(size_t) 0 * WIDTH + CH0 + c] * wh[(size_t) c * 4 + 2];
-    report("short conv at position 1", down(o1, C), r1, 1e-6);
-    k::conv_store(x, ring, CH0, dpos(pos0), R, 3, C, nullptr);
-    const auto rg = down(ringd, ringh.size());
-    bool ok = true;
-    for (int r = 0; r < R; ++r)
-        for (int c = 0; c < C; c += 97) {
-            const float want = r >= R - 3 ? xh[(size_t) r * C + c] : ringh[(size_t) ((pos0 + r) % SLOTS) * WIDTH + CH0 + c];
-            ok &= rg[(size_t) ((pos0 + r) % SLOTS) * WIDTH + CH0 + c] == want;
+    {
+        auto x = randn(CA), w = randn((size_t) CA * 4, 0.3f), ringh = randn((size_t) SLOTS * WIDTH);
+        k::ConvJob a{up(x), up(w), nullptr, zeros<float>(CA), 0, CA, 1.0f};
+        k::conv_rows(a, nullptr, HW, {up(ringh), SLOTS, WIDTH}, dpos(1), 1, 1, nullptr);
+        std::vector<double> r1(CA);
+        for (int c = 0; c < CA; ++c) r1[c] = conv_ref(x, w, nullptr, ringh, WIDTH, SLOTS, 0, CA, 1, 0, c, 1.0);
+        report("short conv at position 1", down(a.out, CA), r1, 1e-6);
+    }
+    // into the residual: added, a block's start (saved and replaced), and the experts' sum as the input
+    const int R = 5;
+    const int64_t pos0 = 37;
+    auto x = randn((size_t) R * CR), w = randn((size_t) CR * 4, 0.3f), curh = randn((size_t) R * CR), ringh = randn((size_t) SLOTS * WIDTH);
+    auto eo = randn((size_t) R * KTOP * CR), ew = randn((size_t) R * KTOP, 0.3f);
+    const float scale = 1.0f / std::sqrt(5.0f);
+    for (int mode = 0; mode < 3; ++mode) {
+        float* cur = up(curh);
+        float* save = mode == 1 ? zeros<float>((size_t) R * CR) : nullptr;
+        std::vector<float> in = x;
+        if (mode == 2)
+            for (int r = 0; r < R; ++r)
+                for (int c = 0; c < CR; ++c) {
+                    double acc = 0;
+                    for (int q = 0; q < KTOP; ++q) acc += (double) ew[(size_t) r * KTOP + q] * eo[((size_t) r * KTOP + q) * CR + c];
+                    in[(size_t) r * CR + c] = (float) acc;
+                }
+        k::ConvJob a{mode == 2 ? nullptr : up(x), up(w), nullptr, nullptr, 2048, CR, scale};
+        k::conv_residual(a, mode == 2 ? up(eo) : nullptr, mode == 2 ? up(ew) : nullptr, KTOP, HW, {up(ringh), SLOTS, WIDTH}, dpos(pos0), R,
+                         R, cur, save, nullptr);
+        std::vector<double> ref((size_t) R * CR);
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < CR; ++c) {
+                const double o = conv_ref(in, w, nullptr, ringh, WIDTH, SLOTS, 2048, CR, pos0, r, c, scale);
+                ref[(size_t) r * CR + c] = mode == 1 ? o : curh[(size_t) r * CR + c] + o;
+            }
+        static const char* names[3] = {"conv into the residual", "conv starting a block", "conv of the experts' sum"};
+        report(names[mode], down(cur, ref.size()), ref, mode == 2 ? 1e-5 : 1e-6);
+        if (mode == 1) {
+            const bool ok = down(save, curh.size()) == curh;
+            std::printf("%-34s %s\n", "block start saves the stream", ok ? "ok" : "FAIL");
+            failures += !ok;
         }
-    std::printf("%-34s %s\n", "conv ring keeps the last rows", ok ? "ok" : "FAIL");
-    failures += !ok;
+    }
 }
 
 // --------------------------------------------------------------------------------- the attention's inputs and itself
@@ -309,7 +437,8 @@ void check_attention(bool full, int R) {
     void* ws = nullptr;
     cudaMalloc(&ws, k::attention_workspace_bytes(R, H, maxk));
     float* out = zeros<float>((size_t) R * H * D);
-    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, R, ws, out, nullptr);
+    void* oq = zeros<uint8_t>((size_t) R * H * D / 32 * 36);
+    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, R, ws, out, oq, nullptr);
     const auto qg = down(q, qr.size()), rg = down(r, rr.size());
     const auto kb = down(kcd, kc.size()), vb = down(vcd, vc.size());
     std::vector<double> ref((size_t) R * H * D);
@@ -347,13 +476,20 @@ void check_attention(bool full, int R) {
         }
     }
     const auto got = down(out, ref.size());
+    {   // its q8_1 blocks: quantize_q8_1_rows's
+        void* oq2 = zeros<uint8_t>((size_t) R * H * D / 32 * 36);
+        bk::quantize_q8_1_rows(out, R, H * D, oq2, nullptr);
+        const bool ok = down((uint8_t*) oq, (size_t) R * H * D / 32 * 36) == down((uint8_t*) oq2, (size_t) R * H * D / 32 * 36);
+        std::printf("%-34s %s\n", "attention's q8_1 blocks", ok ? "bit for bit" : "FAIL");
+        failures += !ok;
+    }
     if (R > 16) {   // a row alone takes the decode's splits: not the same sums
         report(full ? "attention, full layer, prompt splits" : "attention, sliding, prompt splits", got, ref, 1e-4);
         return;
     }
     report(full ? "attention, full layer (> extent)" : "attention, sliding (wrapped ring)", got, ref, 1e-4);
     float* one = zeros<float>((size_t) H * D);
-    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, 1, ws, one, nullptr);
+    k::attention(q, r, sink, gate, rb, (const uint16_t*) kcd, (const uint16_t*) vcd, aa, dpos(apos), apos, 1, ws, one, nullptr, nullptr);
     same(full ? "attention, full layer" : "attention, sliding", down(one, (size_t) H * D).data(), got.data(), (size_t) H * D);
 }
 
@@ -399,7 +535,6 @@ void check_experts() {
     unsigned long long* eptr = up(ptrs);
     float* x = up(xh);
     int32_t* idd = up(ids);
-    float* wd = up(wts);
     const size_t q8 = (size_t) E / 32 * 36;
     void* xq = zeros<uint8_t>((size_t) R * q8);
     bk::quantize_q8_1_rows(x, R, E, xq, nullptr);
@@ -411,7 +546,7 @@ void check_experts() {
     auto run = [&](int rows, float* yy) {
         k::group_experts(idd, rows, KTOP, NEXP, eptr, nullptr, gp, nullptr, gs, ng, dst, tok, nullptr);
         bk::native_expert_grouped(L, gp, gs, ng, dst, tok, NEXP, (int64_t) rows * KTOP, xq, scratch, eo, nullptr);
-        k::sum_experts(eo, wd, rows, KTOP, E, yy, nullptr);
+        sum_experts_host(eo, wts.data(), rows, yy);
     };
     run(R, y);
     // the reference: ggml's dequantizer, situ and the weighted sum in double
@@ -528,7 +663,6 @@ void check_exl3_experts(bool bench = false) {
     auto* gr = zeros<bk::Exl3Rates>(NE);
     float* x = up(xh);
     int32_t* idd = up(ids);
-    float* wd = up(wts);
     auto* gp = zeros<unsigned long long>(NE);
     int32_t *gs = zeros<int32_t>(NE + 1), *ng = zeros<int32_t>(1), *dst = zeros<int32_t>((size_t) R * KTOP), *tok = zeros<int32_t>((size_t) R * KTOP);
     void* scratch = zeros<uint8_t>(std::max(bk::native_expert_scratch_bytes(L[0], (int64_t) R * KTOP), bk::native_expert_scratch_bytes(L[1], (int64_t) R * KTOP)));
@@ -538,7 +672,7 @@ void check_exl3_experts(bool bench = false) {
         k::group_experts(idd + row * KTOP, rows, KTOP, NE, eptr, er, gp, gr, gs, ng, dst, tok, nullptr);
         bk::exl3_expert_grouped(L[0], gp, gs, ng, dst, tok, std::min(NE, rows * KTOP), rows * KTOP, x + row * E,
                                 scratch, eo, nullptr, 0, gr);
-        k::sum_experts(eo, wd + row * KTOP, rows, KTOP, E, yy, nullptr);
+        sum_experts_host(eo, wts.data() + row * KTOP, rows, yy);
     };
     if (bench) {   // a decode step, cycling through distinct picks so the blobs do not all fit in cache
         size_t bytes = 0;
@@ -583,7 +717,7 @@ void check_exl3_experts(bool bench = false) {
         k::group_experts(up(picks), R, KTOP, NE, eptr, nullptr, gp, nullptr, gs, ng, dst, tok, nullptr);
         bk::native_expert_grouped(L[c], gp, gs, ng, dst, tok, NE, R * KTOP, x, scratch, eo, nullptr);
     }
-    k::sum_experts(eo, wd, R, KTOP, E, y, nullptr);
+    sum_experts_host(eo, wts.data(), R, y);
     const bool identical = std::memcmp(down(y, got.size()).data(), got.data(), got.size() * sizeof(float)) == 0;
     std::printf("EXL3 mixed vs uniform groups: %s\n", identical ? "identical" : "FAIL");
     failures += !identical;
@@ -609,6 +743,7 @@ int main(int argc, char** argv) {
     }
     check_mix();
     check_control();
+    check_norm_quant();
     check_conv();
     check_attention(false, 3);
     check_attention(true, 3);
