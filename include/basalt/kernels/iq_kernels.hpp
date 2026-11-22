@@ -29,6 +29,26 @@ void quantize_q8_1_rows_copy(const float* x, int64_t n_rows, int64_t n_cols, voi
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
+/// Up to kMmvqSetMax matrices of one type and input width over the same q8_1 columns: y[i][c][r] = w[i][r] . x[c] for
+/// r < n_out[i]. One launch where iq_mmvq takes its plain kernel for the type and column count, each matrix's result
+/// bitwise its own iq_mmvq call; separate calls where iq_mmvq takes another kernel (IQ3_S on 2 columns and up).
+constexpr int kMmvqSetMax = 8;
+struct MmvqSet {
+    const void* w[kMmvqSetMax] = {};
+    float* y[kMmvqSetMax] = {};
+    int n_out[kMmvqSetMax] = {};
+    int n = 0;
+    void add(const void* wi, float* yi, int n_out_i) {   // past kMmvqSetMax: iq_mmvq_set refuses the set
+        if (n < kMmvqSetMax) {
+            w[n] = wi;
+            y[n] = yi;
+            n_out[n] = n_out_i;
+        }
+        ++n;
+    }
+};
+void iq_mmvq_set(int ggml_type, const MmvqSet& set, const void* x_q8_1, int n_in, int ncols, void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.  `scale` (device, NVFP4 only): the
 /// matrix's FP32 scale, applied in fp32 before the fp16 rounding.
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream,

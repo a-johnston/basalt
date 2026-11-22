@@ -229,6 +229,26 @@ private:
         bk::iq_mmvq(w->type, w->ptr, xq, y, n_in, n_out, R, stream_);
     }
     void quant(const float* x, int R, int n, void* xq) { bk::quantize_q8_1_rows(x, R, n, xq, stream_); }
+
+    // projections of the q8_1 inputs xq[in]: those of one input and one type in one launch (each bitwise its own gemv)
+    struct Proj {
+        const DevTensor* t;
+        float* y;
+        int n_out, in;
+    };
+    void gemv_sets(const Proj* p, int n, const void* const* xq, int n_in, int R) {
+        bool done[bk::kMmvqSetMax] = {};
+        for (int i = 0; i < n; ++i) {
+            if (done[i]) continue;
+            bk::MmvqSet set;
+            for (int j = i; j < n; ++j)
+                if (!done[j] && xq[p[j].in] == xq[p[i].in] && p[j].t->type == p[i].t->type) {
+                    set.add(p[j].t->ptr, p[j].y, p[j].n_out);
+                    done[j] = true;
+                }
+            bk::iq_mmvq_set(p[i].t->type, set, xq[p[i].in], n_in, R, stream_);
+        }
+    }
     size_t q8(int n) const { return (size_t) n / 32 * 36; }
 
     ik::States states(const std::vector<const float*>& blocks, const float* cur) const {
@@ -274,16 +294,15 @@ private:
         for (int j = 0; j < distinct; ++j) quant(nrm_ + j * RE, R, E, (uint8_t*) xq_ + j * R * q8(E));
         const void* xq[3];
         for (int j = 0; j < 3; ++j) xq[j] = (uint8_t*) xq_ + (distinct == 1 ? 0 : j) * R * q8(E);
-        gemv(T(l, "attn_q.weight"), xq[0], q_, E, nq, R);
-        gemv(T(l, "attn_k.weight"), xq[1], kraw_, E, nkv, R);
-        gemv(T(l, "attn_v.weight"), xq[2], vraw_, E, nkv, R);
-        gemv(T(l, "attn_rel.weight"), xq[0], r_, E, nrel, R);
-        gemv(T(l, "attn_sink_proj.weight"), xq[0], sink_, E, g_.n_head, R);
-        gemv(T(l, "attn_gate.weight"), xq[0], gate_, E, nq, R);
+        Proj pr[8] = {{T(l, "attn_q.weight"), q_, nq, 0},          {T(l, "attn_k.weight"), kraw_, nkv, 1},
+                      {T(l, "attn_v.weight"), vraw_, nkv, 2},      {T(l, "attn_rel.weight"), r_, nrel, 0},
+                      {T(l, "attn_sink_proj.weight"), sink_, g_.n_head, 0}, {T(l, "attn_gate.weight"), gate_, nq, 0}};
+        int n_pr = 6;
         if (!swa) {
-            gemv(T(l, "attn_k_conv_proj.weight"), xq[1], dk_, E, g_.n_kv * 4, R);
-            gemv(T(l, "attn_v_conv_proj.weight"), xq[2], dv_, E, g_.n_kv * 4, R);
+            pr[n_pr++] = {T(l, "attn_k_conv_proj.weight"), dk_, g_.n_kv * 4, 1};
+            pr[n_pr++] = {T(l, "attn_v_conv_proj.weight"), dv_, g_.n_kv * 4, 2};
         }
+        gemv_sets(pr, n_pr, xq, E, R);
         const ik::ConvRing ring{ring_[(size_t) s], kRing, width_};
         const float kv_scale = 1.0f / std::sqrt((float) ((swa ? 1 : 2) * g_.n_conv + 1));
         const float post_scale = 1.0f / std::sqrt((float) (g_.n_conv + 1));

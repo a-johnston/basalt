@@ -13,6 +13,8 @@
 //     must not write included.
 // (3) iq_mmvq's IQ3_S columns on the tensor-core kernel (MMVQ_MMA, turned on here where the device has it)
 //     against the old kernel, bitwise; with MMVQ_MMA=1 in the environment (1) takes it as well.
+// (4) iq_mmvq_set, every format: three matrices (row tails among them) in one call against an iq_mmvq call each,
+//     bitwise, the outputs past each matrix's rows untouched; (1) holds iq_mmvq to the double reference.
 //
 // NVFP4 blocks come in three scale profiles (narrow; pack-like block values with 2e-5..2e-4 tails; pack-like with scale
 // bytes 0x7F, 0xFF, bit 7 set, 0 and subnormals), all of which every path must decode alike.
@@ -218,6 +220,54 @@ void check_mmvq(int t, int n_in, int n_out, cudaStream_t s, std::mt19937& rng) {
                 bad ? "FAIL" : "bitwise equal to the old kernel", worst);
     g_fail += bad;
     cudaFree(dw); cudaFree(dwf); cudaFree(dx); cudaFree(dxq); cudaFree(dy_old); cudaFree(dy_new);
+}
+
+// ------------------------------------------------------------------------------------------ (4) iq_mmvq_set
+void check_mmvq_set(int t, int n_in, cudaStream_t s, std::mt19937& rng) {
+    const int n_outs[3] = {67, 5, 130}, max_cols = 11;
+    std::vector<uint8_t*> dw(3);
+    std::vector<float*> y_one(3), y_set(3);
+    for (int m = 0; m < 3; ++m) {
+        const auto w = random_rows(t, n_outs[m], n_in, rng);
+        dw[m] = dalloc<uint8_t>(w.size());
+        ck(cudaMemcpy(dw[m], w.data(), w.size(), cudaMemcpyHostToDevice), "w");
+        y_one[m] = dalloc<float>((size_t) max_cols * n_outs[m] + 64);
+        y_set[m] = dalloc<float>((size_t) max_cols * n_outs[m] + 64);
+    }
+    const auto x = random_x((size_t) max_cols * n_in, rng);
+    float* dx = dalloc<float>(x.size());
+    ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    uint8_t* dxq = dalloc<uint8_t>((size_t) max_cols * (n_in / 32) * 36);
+    k::quantize_q8_1_rows(dx, max_cols, n_in, dxq, s);
+    int bad = 0;
+    for (int nc : {1, 2, 3, 4, 5, 6, 7, 8, 11}) {
+        k::MmvqSet set;
+        for (int m = 0; m < 3; ++m) {
+            const size_t n = (size_t) max_cols * n_outs[m] + 64;
+            ck(cudaMemset(y_one[m], 0xFF, n * 4), "memset");
+            ck(cudaMemset(y_set[m], 0xFF, n * 4), "memset");
+            k::iq_mmvq(t, dw[m], dxq, y_one[m], n_in, n_outs[m], nc, s);
+            set.add(dw[m], y_set[m], n_outs[m]);
+        }
+        k::iq_mmvq_set(t, set, dxq, n_in, nc, s);
+        ck(cudaStreamSynchronize(s), "sync");
+        for (int m = 0; m < 3; ++m) {
+            const size_t n = (size_t) max_cols * n_outs[m] + 64;
+            std::vector<float> a(n), b(n);
+            ck(cudaMemcpy(a.data(), y_one[m], n * 4, cudaMemcpyDeviceToHost), "y_one");
+            ck(cudaMemcpy(b.data(), y_set[m], n * 4, cudaMemcpyDeviceToHost), "y_set");
+            if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
+                std::printf("  %-8s matrix %d (%d rows) ncols %2d: differs from its own iq_mmvq call  FAIL\n", name_of(t), m,
+                            n_outs[m], nc);
+                ++bad;
+            }
+        }
+    }
+    std::printf("%-8s type %2d  iq_mmvq_set of 67, 5 and 130 rows x %d, ncols 1..8, 11: %s\n", name_of(t), t, n_in,
+                bad ? "FAIL" : "bitwise equal to a call each");
+    g_fail += bad;
+    for (int m = 0; m < 3; ++m) { cudaFree(dw[m]); cudaFree(y_one[m]); cudaFree(y_set[m]); }
+    cudaFree(dx); cudaFree(dxq);
 }
 
 // (3) MMVQ_MMA: iq_mmvq's IQ3_S columns on the tensor-core kernel, turned on here where the device has it,
@@ -564,6 +614,7 @@ int main(int argc, char** argv) {
     check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
     check_grouped(40, 40, 1024, 512, s, rng);
     check_mmvq_mma(s, rng);
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40, 12, 13, 7, 8}) check_mmvq_set(t, 2560, s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);

@@ -1792,16 +1792,11 @@ struct IqGridWords {
 };
 
 // mmvq_kernel with the columns taken NC at a time.  After warp_sum every lane holds the same sum, so lane c stores
-// column c.
-template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>>
-__global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
-                                                         const block_q8_1* __restrict__ x, float* __restrict__ y,
-                                                         int n_in, int n_out, int ncols) {
-    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, STAGE_GRID>::value];
-    const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
-    pdl_wait();   // the grid table above is constant
-    const int row = blockIdx.x * 4 + threadIdx.y;
-    if (row >= n_out) return;
+// column c.  One warp's row; mmvq_multi_kernel and mmvq_set_kernel share it, so a matrix of a set is bitwise its own call.
+template<int TY, int NC, bool STAGE_GRID>
+__device__ __forceinline__ void mmvq_multi_row(const uint8_t* __restrict__ w, size_t row_bytes, const block_q8_1* __restrict__ x,
+                                               float* __restrict__ y, int n_in, int n_out, int ncols, int row,
+                                               const uint32_t* s_grid) {
     const int lane = threadIdx.x;
     const int nb = n_in / Fmt<TY>::qk, xb = n_in / 32;
     const uint8_t* wr = w + (size_t) row * row_bytes;
@@ -1816,6 +1811,40 @@ __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restri
         for (int c = 0; c < NC; ++c)
             if (c < n && lane == c) y[(size_t) (c0 + c) * n_out + row] = s[c];
     }
+}
+
+template<int TY, int NC, bool STAGE_GRID = kStageIqGrid<TY>>
+__global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                         const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                         int n_in, int n_out, int ncols) {
+    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, STAGE_GRID>::value];
+    const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    pdl_wait();   // the grid table above is constant
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    if (row >= n_out) return;
+    mmvq_multi_row<TY, NC, STAGE_GRID>(w, row_bytes, x, y, n_in, n_out, ncols, row, s_grid);
+}
+
+// iq_mmvq_set: the matrices' blocks of 4 rows side by side, blk0[m] the first block of matrix m.
+struct MmvqSetArgs {
+    const uint8_t* w[kMmvqSetMax];
+    float* y[kMmvqSetMax];
+    int n_out[kMmvqSetMax];
+    int blk0[kMmvqSetMax + 1];
+    int n;
+};
+
+template<int TY, int NC>
+__global__ void __launch_bounds__(128) mmvq_set_kernel(MmvqSetArgs a, size_t row_bytes, const block_q8_1* __restrict__ x, int n_in,
+                                                       int ncols) {
+    __shared__ alignas(16) uint32_t s_grid_buf[IqGridWords<TY, false>::value];
+    const uint32_t* s_grid = stage_iq_grid<TY, false>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    pdl_wait();
+    int m = 0;
+    while (m + 1 < a.n && (int) blockIdx.x >= a.blk0[m + 1]) ++m;
+    const int row = ((int) blockIdx.x - a.blk0[m]) * 4 + threadIdx.y;
+    if (row >= a.n_out[m]) return;
+    mmvq_multi_row<TY, NC, false>(a.w[m], row_bytes, x, a.y[m], n_in, a.n_out[m], ncols, row, s_grid);
 }
 
 // ---------------------------------------------------------------- grouped native experts
@@ -3396,6 +3425,33 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
     }
 }
 
+// The matrices of `set` in one launch where launch_mmvq<TY> would take mmvq_multi_kernel<TY, NC, false> for each (the
+// single-matrix mmvq never stages the grid tables); false where it would take another kernel.
+template<int TY>
+bool launch_mmvq_set(const MmvqSet& set, size_t rb, const block_q8_1* X, int n_in, int ncols, cudaStream_t s) {
+    if constexpr (!kSplit<TY>) {
+        return false;
+    } else {
+        if (g_old_kernels || (TY == 21 && ncols >= 2)) return false;   // IQ3_S's tensor-core path takes 2 columns and up
+        MmvqSetArgs a{};
+        a.n = set.n;
+        for (int i = 0; i < set.n; ++i) {
+            a.w[i] = (const uint8_t*) set.w[i];
+            a.y[i] = set.y[i];
+            a.n_out[i] = set.n_out[i];
+            a.blk0[i + 1] = a.blk0[i] + (set.n_out[i] + 3) / 4;
+        }
+        const dim3 grid((unsigned) a.blk0[set.n]), block(32, 4);
+        auto go = [&](auto kernel) { launch_pdl(kernel, grid, block, 0, s, a, rb, X, n_in, ncols); };
+        if (ncols <= 1) go(mmvq_set_kernel<TY, 1>);
+        else if (ncols == 2) go(mmvq_set_kernel<TY, 2>);
+        else if (ncols <= 4) go(mmvq_set_kernel<TY, 4>);
+        else if (ncols <= 6 && g_nc6) go(mmvq_set_kernel<TY, 6>);
+        else go(mmvq_set_kernel<TY, 8>);
+        return true;
+    }
+}
+
 #include "gu2.cuh"
 
 template<int TG>
@@ -3556,6 +3612,24 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         default: basalt::log::error("basalt", "iq_mmvq: type %d is not supported", t); std::exit(1);
     }
     check("iq_mmvq");
+}
+
+void iq_mmvq_set(int t, const MmvqSet& set, const void* x_q8_1, int n_in, int ncols, void* stream) {
+    if (set.n <= 0) return;
+    if (set.n > kMmvqSetMax) { basalt::log::error("basalt", "iq_mmvq_set: %d matrices", set.n); std::exit(1); }
+    const size_t rb = iq_row_bytes(t, n_in);
+    cudaStream_t s = (cudaStream_t) stream;
+    const auto* X = (const block_q8_1*) x_q8_1;
+    bool one = false;
+    switch (t) {
+#define MMVQ_CASE(T) case T: one = launch_mmvq_set<T>(set, rb, X, n_in, ncols, s); break;
+        MMVQ_FMTS(MMVQ_CASE)
+#undef MMVQ_CASE
+        default: basalt::log::error("basalt", "iq_mmvq_set: type %d is not supported", t); std::exit(1);
+    }
+    if (!one)
+        for (int i = 0; i < set.n; ++i) iq_mmvq(t, set.w[i], x_q8_1, set.y[i], n_in, set.n_out[i], ncols, stream);
+    check("iq_mmvq_set");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
