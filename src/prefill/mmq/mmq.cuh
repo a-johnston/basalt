@@ -889,7 +889,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    // A dense product keeps a whole K reduction on one block, independent of the activation row count.
+    const dim3 block_nums_stream_k(!args.ids_dst || tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 

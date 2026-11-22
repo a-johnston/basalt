@@ -16,6 +16,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/router.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/inkling2x/dspark_kernels.hpp"
 #include "basalt/models/inkling2x/kernels.hpp"
 #include "basalt/log.hpp"
@@ -36,6 +37,7 @@ namespace {
 
 namespace bk = basalt::kernels;
 namespace ik = inkling2x::kernels;
+namespace mmq = basalt::prefill::mmq;
 
 constexpr int kMaxWindow = ik::kMaxMembers;   // rows of a decode window, and of a batch of them
 constexpr int kChunk = 128;                    // rows of a prompt chunk: the most a forward takes
@@ -67,6 +69,8 @@ struct Buffers {
 
 struct Scratch {
     Buffers mem;
+    mmq::Context prompt;
+    std::vector<int8_t> prompt_layers;  // each stored layer's projection types and shapes fit D4 MMQ
     int32_t* tok = nullptr;
     int64_t* pos = nullptr;   // each row's position, which the kernels read
     float *emb = nullptr, *cur = nullptr, *pre = nullptr, *out[2] = {nullptr, nullptr}, *mix = nullptr, *msg = nullptr, *ctl = nullptr,
@@ -102,6 +106,7 @@ struct Scratch {
         const char* w = "the forward's scratch";
         size_t escr_bytes = 0;
         for (int l = 0; l < g.n_layers; ++l) escr_bytes = std::max(escr_bytes, bk::native_expert_scratch_bytes(m.expert_layout(l), (int64_t) R * K));
+        escr_bytes = std::max(escr_bytes, mmq::q8_bytes(R, std::max(E, nq)));
         bool ok = mem.take(tok, R, err, w) && mem.take(pos, R, err, w) && mem.take(emb, RE, err, w) && mem.take(cur, RE, err, w) &&
                   mem.take(pre, RE, err, w) && mem.take(out[0], RE, err, w) && mem.take(out[1], RE, err, w) && mem.take(mix, 3 * RE, err, w) &&
                   mem.take(msg, 4 * RE, err, w) && mem.take(ctl, 3 * RE, err, w) && mem.take(nrm, 3 * RE, err, w) &&
@@ -121,6 +126,7 @@ struct Scratch {
                   mem.take(lp, bk::row_logprobs_scratch_floats(kMaxWindow, g.n_vocab) + (size_t) kMaxWindow * bk::kLogprobStride, err, w) &&
                   mem.take(escr, escr_bytes, err, w) && mem.take(ws, ik::attention_workspace_bytes(R, g.n_head, m.context()), err, w);
         if (!ok) return false;
+        prompt_layers.assign(g.n_layers, -1);
         blk.assign((size_t) g.slots(), nullptr);
         for (int s = 0; s < g.slots(); ++s)
             if (g.layer_of(s) % g.block == 0 && !mem.take(blk[(size_t) s], RE, err, w)) return false;
@@ -425,23 +431,25 @@ private:
         bk::iq_mmvq(w->type, w->ptr, xq, y, n_in, n_out, R, stream_);
     }
 
-    // projections of the q8_1 inputs xq[in]: those of one input and one type in one launch (each bitwise its own gemv)
+    // A prompt reuses each input's D4 blocks across its projections. Decode groups matrices by input and type.
     struct Proj {
         const DevTensor* t;
         float* y;
         int n_out, in;
     };
-    void gemv_sets(const Proj* p, int n, const void* const* xq, int n_in, int R) {
+    void project_sets(const Proj* p, int n, const void* const* xq, int n_in, int R, bool prompt) {
         bool done[bk::kMmvqSetMax] = {};
         for (int i = 0; i < n; ++i) {
             if (done[i]) continue;
+            if (prompt) mmq::repack_d4(xq[p[i].in], x_->escr, R, n_in, stream_);
             bk::MmvqSet set;
             for (int j = i; j < n; ++j)
-                if (!done[j] && xq[p[j].in] == xq[p[i].in] && p[j].t->type == p[i].t->type) {
-                    set.add(p[j].t->ptr, p[j].y, p[j].n_out);
+                if (!done[j] && xq[p[j].in] == xq[p[i].in] && (prompt || p[j].t->type == p[i].t->type)) {
+                    if (prompt) x_->prompt.dense(x_->escr, p[j].t->type, p[j].t->ptr, p[j].y, R, p[j].n_out, n_in, stream_);
+                    else set.add(p[j].t->ptr, p[j].y, p[j].n_out);
                     done[j] = true;
                 }
-            bk::iq_mmvq_set(p[i].t->type, set, xq[p[i].in], n_in, R, stream_);
+            if (!prompt) bk::iq_mmvq_set(p[i].t->type, set, xq[p[i].in], n_in, R, stream_);
         }
     }
     size_t q8(int n) const { return (size_t) n / 32 * 36; }
@@ -512,7 +520,16 @@ private:
             pr[n_pr++] = {T(l, "attn_k_conv_proj.weight"), x.dk, g_.n_kv * 4, 1};
             pr[n_pr++] = {T(l, "attn_v_conv_proj.weight"), x.dv, g_.n_kv * 4, 2};
         }
-        gemv_sets(pr, n_pr, xq, E, R);
+        const auto* wo = T(l, "attn_output.weight");
+        const bool chunk = run.head[0] == 0 && R > kMaxWindow;
+        auto& eligible = x.prompt_layers[l];
+        if (chunk && eligible < 0) {
+            auto fits = [](const DevTensor* w, int n) { return mmq::uses_d4(w->type) && mmq::fits(w->type, n); };
+            eligible = fits(wo, E);
+            for (int j = 0; eligible && j < n_pr; ++j) eligible = fits(pr[j].t, pr[j].n_out);
+        }
+        const bool prompt = chunk && eligible;
+        project_sets(pr, n_pr, xq, E, R, prompt);
         const ik::ConvRing ring = ring_of(run, s);
         const ik::KvCaches caches = caches_of(run, s);
         const float kv_scale = 1.0f / std::sqrt((float) ((swa ? 1 : 2) * g_.n_conv + 1));
@@ -555,7 +572,10 @@ private:
         ik::attention(x.q, x.r, x.sink, x.gate, F(l, "attn_rel_bias.weight"), caches, attn_args(s, l), run.m, x.pos, run.last(), x.ws, x.att,
                       x.attq, stream_);
         if (diag()) dump("att-" + std::to_string(s), x.att, (int64_t) R * nq);
-        gemv(T(l, "attn_output.weight"), x.attq, x.o, nq, E, R);
+        if (prompt) {
+            mmq::repack_d4(x.attq, x.escr, R, nq, stream_);
+            x.prompt.dense(x.escr, wo->type, wo->ptr, x.o, R, E, nq, stream_);
+        } else gemv(wo, x.attq, x.o, nq, E, R);
         // the output's convolution into the residual: a block's first layer starts a new stream (the one before joins the
         // mixed states), the others add
         ik::ConvJob oj;
@@ -651,7 +671,7 @@ private:
         for (int i = 0; i < c->n_layers; ++i) {
             const void* xq = x.xq + (size_t) i * rows * q8(E);
             Proj pr[2] = {{m_.dtensor(i, "attn_k_ctx.weight"), x.kraw, nkv, 0}, {m_.dtensor(i, "attn_v_ctx.weight"), x.vraw, nkv, 0}};
-            gemv_sets(pr, 2, &xq, E, rows);
+            project_sets(pr, 2, &xq, E, rows, false);
             ik::qk_norm_rope_store(nullptr, nullptr, x.kraw, (const float*) m_.dtensor(i, "attn_k_ctx_norm.weight")->ptr, x.vraw, qa, x.pos, rows,
                                    dkc_[(size_t) i], dvc_[(size_t) i], dcells_[(size_t) i], stream_);
         }
@@ -761,7 +781,7 @@ private:
             ik::add_norm_quant(x.dres, i == 0 ? nullptr : x.dadd, DF(i, "attn_norm.weight"), B, E, eps, nullptr, x.dxq, stream_);
             const void* xq = x.dxq;
             Proj pr[3] = {{D(i, "attn_q.weight"), x.dq, nq, 0}, {D(i, "attn_k.weight"), x.kraw, nkv, 0}, {D(i, "attn_v.weight"), x.vraw, nkv, 0}};
-            gemv_sets(pr, 3, &xq, E, B);
+            project_sets(pr, 3, &xq, E, B, false);
             ik::qk_norm_rope_store(x.dq, DF(i, "attn_q_norm.weight"), x.kraw, DF(i, "attn_k_norm.weight"), x.vraw, qa, x.rope_pos, B,
                                    dkc_[(size_t) i], dvc_[(size_t) i], dcells_[(size_t) i], stream_);
             ik::KvCaches kv;
@@ -772,7 +792,7 @@ private:
             gemv(D(i, "attn_output.weight"), x.attq, x.dadd, nq, E, B);
             ik::add_norm_quant(x.dres, x.dadd, DF(i, "ffn_norm.weight"), B, E, eps, nullptr, x.dxq, stream_);
             Proj mlp[2] = {{D(i, "ffn_gate.weight"), gate, c->n_ff, 0}, {D(i, "ffn_up.weight"), up, c->n_ff, 0}};
-            gemv_sets(mlp, 2, &xq, E, B);
+            project_sets(mlp, 2, &xq, E, B, false);
             ik::swiglu_quant(gate, up, B, c->n_ff, x.dhq, stream_);
             gemv(D(i, "ffn_down.weight"), x.dhq, x.dadd, c->n_ff, E, B);
         }

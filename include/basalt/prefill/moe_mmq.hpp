@@ -39,6 +39,11 @@ int64_t q8_blocks(int64_t cols);
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
 
+/// MMQ can consume a row-major q8_1 activation without requantizing for weights with the D4 layout.
+bool uses_d4(int ggml_type);
+/// Copy the codes and widen the fp16 scales into a `q8_bytes` buffer. `cols` is a multiple of 32; padding blocks are zero.
+void repack_d4(const void* q8_1, void* dst, int rows, int cols, void* stream);
+
 /// Rows ids[0..rows) of `xq` (`src_rows` rows quantized for MMQ, `cols` values each) into `dst` as `rows` rows: the same
 /// bytes `quantize` writes when given those ids.
 void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);
@@ -76,6 +81,20 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    /// [rows, cols] quantized by `quantize` times one [outputs, cols] weight matrix transposed, no row map.
+    void dense(const void* xq, int type, const void* weights, float* dst, int rows, int outputs, int cols, void* stream) {
+        Product p;
+        p.w = weights;
+        p.type = type;
+        p.w_cols = cols;
+        p.w_rows = p.ld_dst = outputs;
+        p.total_rows = p.max_rows = rows;
+        p.opt_rows = 32;  // the same tile choice even for a short final chunk
+        p.n = 1;
+        p.xq = xq;
+        p.dst = dst;
+        run(p, stream);
+    }
 
 private:
     void* ctx_ = nullptr;

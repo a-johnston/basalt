@@ -22,6 +22,19 @@ void ck(cudaError_t e, const char* what) {
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 
+// A warp transposes four adjacent q8_1 blocks into one D4 block. Each lane copies four codes.
+__device__ void repack_d4_tile(int row, int tile, int lane, const block_q8_1* src, block_q8_1_mmq* dst, int rows, int nb) {
+    if (row >= rows) return;
+    const int b = 4 * tile + lane / 8;
+    auto& out = dst[(size_t) tile * rows + row];
+    const auto* in = src + (size_t) row * nb;
+    ((int*) out.qs)[lane] = b < nb ? ((const int*) in[b].qs)[lane % 8] : 0;
+    if (lane % 8 == 0) out.d4[lane / 8] = b < nb ? __low2float(in[b].ds) : 0.0f;
+}
+__global__ void repack_d4_kernel(const block_q8_1* src, block_q8_1_mmq* dst, int rows, int nb) {
+    repack_d4_tile(blockIdx.x * 4 + threadIdx.x / 32, blockIdx.y, threadIdx.x % 32, src, dst, rows, nb);
+}
+
 // `t` (optional): 16 more bytes (an NVFP4 expert's scale tail) to t_dst
 __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uint4* __restrict__ b, int64_t nb,
                               uint4* __restrict__ ab_dst, const uint4* __restrict__ c, int64_t nc, uint4* __restrict__ c_dst,
@@ -243,6 +256,17 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 int64_t q8_blocks(int64_t cols) { return pad512(cols) / (4 * QK8_1); }
 
+bool uses_d4(int type) {
+    return supported(type) && mmq_get_q8_1_ds_layout((ggml_type) type) == MMQ_Q8_1_DS_LAYOUT_D4;
+}
+
+void repack_d4(const void* q8_1, void* dst, int rows, int cols, void* stream) {
+    if (rows <= 0) return;
+    repack_d4_kernel<<<dim3((rows + 3) / 4, (unsigned) q8_blocks(cols)), 128, 0, (cudaStream_t) stream>>>(
+        (const block_q8_1*) q8_1, (block_q8_1_mmq*) dst, rows, cols / QK8_1);
+    ck(cudaGetLastError(), "repack_d4");
+}
+
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
@@ -262,7 +286,7 @@ void Context::run(const Product& p, void* stream) {
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     // the grid always covers max_rows; opt_rows only picks the tile width
-    const int64_t opt = p.opt_rows > 0 && p.opt_rows < p.max_rows ? p.opt_rows : p.max_rows;
+    const int64_t opt = p.opt_rows > 0 && (!p.ids || p.opt_rows < p.max_rows) ? p.opt_rows : p.max_rows;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,

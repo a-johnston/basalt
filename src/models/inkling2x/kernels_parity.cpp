@@ -11,6 +11,7 @@
 #include "basalt/kernels/exl3_kernels.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/models/inkling2x/kernels.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -608,6 +609,95 @@ std::vector<uint8_t> random_blocks(int type, size_t rows, size_t cols) {
     return b;
 }
 
+// One full chunk, a tail of one tile and a row on its own. Compare every output to the old matvec and
+// three nonadjacent rows to a double product of the dequantized weights and activations.
+void check_projection(int type, int K, int N, bool bench) {
+    namespace mmq = basalt::prefill::mmq;
+    constexpr int R = 128;
+    if (!mmq::fits(type, N)) { ++failures; return; }
+    auto weights = random_blocks(type, N, K);
+    auto xh = randn((size_t) R * K);
+    auto *w = up(weights), *q = zeros<uint8_t>(mmq::q8_bytes(R, K)), *q81 = zeros<uint8_t>((size_t) R * K / 32 * 36);
+    auto *x = up(xh), *y = zeros<float>((size_t) R * N);
+    bk::quantize_q8_1_rows(x, R, K, q81, nullptr);
+    const auto packed = down(q81, (size_t) R * K / 32 * 36);
+    std::vector<uint8_t> d4((size_t) R * mmq::q8_blocks(K) * 144, 0);
+    std::vector<double> activ((size_t) R * K);
+    for (int r = 0; r < R; ++r) for (int b = 0; b < K / 32; ++b) {
+        const auto* src = packed.data() + ((size_t) r * K / 32 + b) * 36;
+        auto* dst = d4.data() + ((size_t) (b / 4) * R + r) * 144;
+        __half h;
+        std::memcpy(&h, src, 2);
+        const float scale = __half2float(h);
+        std::memcpy(dst + 4 * (b % 4), &scale, 4);
+        std::memcpy(dst + 16 + 32 * (b % 4), src + 4, 32);
+        for (int j = 0; j < 32; ++j) activ[(size_t) r * K + b * 32 + j] = double(scale) * (int8_t) src[4 + j];
+    }
+    cudaMemset(q, 0xA5, d4.size());
+    mmq::Context ctx;
+    auto product = [&](int first, int rows) {
+        mmq::repack_d4(q81 + (size_t) first * K / 32 * 36, q, rows, K, nullptr);
+        ctx.dense(q, type, w, y, rows, N, K, nullptr);
+    };
+    product(0, R);
+    const auto got = down(y, (size_t) R * N);
+    const bool exact = d4 == down(q, d4.size());
+    std::printf("q8_1 to D4, codes, scales and padding: %s\n", exact ? "identical" : "FAIL");
+    failures += !exact;
+    std::printf("prompt projection type %d, %d x %d x %d\n", type, R, N, K);
+    for (int rows : {1, 19}) {
+        product(37, rows);
+        same("prompt projection at row 37", got.data() + 37 * N, down(y, (size_t) rows * N).data(), (size_t) rows * N);
+    }
+    bk::iq_mmvq(type, w, q81, y, K, N, R, nullptr);
+    const auto old = down(y, got.size());
+    // The IQ2_S and IQ3_XXS matvecs truncate a fractional sub-block scale inside their integer dot.
+    const double old_tol = type == 22 || type == 18 ? 8e-5 : 2e-6;
+    report("prompt vs decode matvec", got, std::vector<double>(old.begin(), old.end()), old_tol);
+    std::vector<float> wd((size_t) N * K), sampled;
+    ggml_get_type_traits((ggml_type) type)->to_float(weights.data(), wd.data(), (int64_t) N * K);
+    std::vector<double> ref;
+    for (int r : {0, 37, R - 1}) {
+        sampled.insert(sampled.end(), got.begin() + r * N, got.begin() + (r + 1) * N);
+        for (int i = 0; i < N; ++i) {
+            double s = 0;
+            for (int j = 0; j < K; ++j) s += double(wd[(size_t) i * K + j]) * activ[(size_t) r * K + j];
+            ref.push_back(s);
+        }
+    }
+    report("prompt vs dequantized FP64", sampled, ref, 2e-6);
+    if (bench) {
+        cudaEvent_t a, b;
+        cudaEventCreate(&a); cudaEventCreate(&b);
+        cudaEventRecord(a);
+        for (int i = 0; i < 100; ++i) product(0, R);
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("repack + product: %.2f us, %.2f TFLOP/s\n", 10 * ms, 2.0 * R * N * K / (10e6 * ms));
+        cudaEventRecord(a);
+        for (int i = 0; i < 100; ++i) mmq::repack_d4(q81, q, R, K, nullptr);
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("D4 repack: %.2f us, %.1f GB/s of codes and scales\n", 10 * ms, (packed.size() + d4.size()) / (1e4 * ms));
+        cudaEventRecord(a);
+        for (int i = 0; i < 100; ++i) bk::iq_mmvq(type, w, q81, y, K, N, R, nullptr);
+        cudaEventRecord(b); cudaEventSynchronize(b);
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("decode matvec: %.2f us, %.2f TFLOP/s\n", 10 * ms, 2.0 * R * N * K / (10e6 * ms));
+        cudaEventDestroy(a); cudaEventDestroy(b);
+    }
+    cudaFree(x); cudaFree(y); cudaFree(q); cudaFree(q81); cudaFree(w);
+}
+
+void check_projections(bool bench) {
+    check_projection(8, E, H * D, bench);
+    check_projection(8, E, H, bench);
+    check_projection(22, E, HKV * D, bench);
+    check_projection(18, E, H * DREL, bench);
+    check_projection(21, H * D, E, bench);
+}
+
 void check_experts() {
     const int R = 3, GU = 18, DN = 20;   // IQ3_XXS gate/up, IQ4_NL down
     bk::NativeExpertLayout L = bk::native_expert_layout(GU, DN, E, FF);
@@ -839,6 +929,7 @@ void check_logits() {
 
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
+        check_projections(true);
         check_exl3_experts(true);
         return failures ? 1 : 0;
     }
@@ -854,6 +945,7 @@ int main(int argc, char** argv) {
     check_experts();
     check_exl3_experts();
     check_logits();
+    check_projections(false);
     if (cudaDeviceSynchronize() != cudaSuccess) {
         std::printf("CUDA error: %s\n", cudaGetErrorString(cudaGetLastError()));
         return 1;

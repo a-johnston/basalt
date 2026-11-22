@@ -11,9 +11,9 @@ Wikitext-2, 100 chunks of 512, rows 256 to 510 of each chunk (25,500 rows), one-
 
 | Pack | Size | PPL | ln(PPL/base) | KLD mean | KLD median | KLD p99 | KLD max | Same top-1 |
 |---|---|---|---|---|---|---|---|---|
-| SAGE REXL3 2.92 bpw | 10.0 GiB | 7.2173 ± 0.1112 | 0.0214 | 0.0297 | 0.0125 | 0.295 | 2.62 | 92.88% |
-| SAGE REXL3 2.26 bpw | 8.3 GiB | 7.4965 ± 0.1156 | 0.0593 | 0.0749 | 0.0316 | 0.792 | 4.54 | 89.35% |
-| InterpreticAI IQ3_XXS | 10.9 GiB | 7.4014 ± 0.1133 | 0.0465 | 0.0658 | 0.0368 | 0.480 | 9.66 | 88.79% |
+| SAGE REXL3 2.92 bpw | 10.0 GiB | 7.2166 ± 0.1112 | 0.0213 | 0.0299 | 0.0126 | 0.301 | 3.04 | 92.95% |
+| SAGE REXL3 2.26 bpw | 8.3 GiB | 7.5003 ± 0.1157 | 0.0598 | 0.0750 | 0.0318 | 0.790 | 4.64 | 89.38% |
+| InterpreticAI IQ3_XXS | 10.9 GiB | 7.3957 ± 0.1132 | 0.0458 | 0.0657 | 0.0368 | 0.471 | 9.13 | 88.79% |
 
 Base PPL 7.0649 on the scored rows. The 2.92 bpw pack is 0.9 GiB smaller than IQ3_XXS and has less than half its mean KLD;
 the 2.26 bpw pack is 2.6 GiB smaller at 14% more. The packs split their bytes differently: the REXL3 packs hold 7.9 or 6.1 GiB of
@@ -26,8 +26,8 @@ The SAGE cards report mean KLD 0.0196 and 96.33% top-1 for
 checkpoint in float64. They do not name the text, context length or scored positions, so their figures and this gate's are not
 comparable. This gate's base is llama.cpp's BF16 conversion of that checkpoint.
 
-The IQ3_XXS pack keeps the GGUF's bytes. Against llama.cpp on the same weights it scores KLD 0.0033 and 97.80% top-1, and its
-greedy output matches llama.cpp's for 60 tokens.
+The IQ3_XXS pack keeps the GGUF's bytes. With the decode matvecs also used for the prompt, the same-weights comparison
+against llama.cpp scores KLD 0.0033 and 97.80% top-1. The BF16 table uses the batched prompt products below.
 
 ## Where each stage rounds
 
@@ -41,7 +41,10 @@ greedy output matches llama.cpp's for 60 tokens.
 | Norms, router, convolutions, loop controllers, depth-mix queries | F32 | F32 | fp32 |
 | K and V | fp16 cache | fp16 cache | fp32 scores, softmax and accumulation |
 
-All activations between stages are fp32. A row's output does not depend on which rows share its launch (bitwise).
+All activations between stages are fp32. Prompt chunks over 16 rows use tensor-core integer dots for the attention projections.
+The input codes and fp16 scales are copied from the same q8_1 blocks used by decode, without requantization. Each prompt tile
+sums its whole dot product, so moving a row within a tile or shortening the chunk does not change that product. The prompt and
+decode products round differently; a changed prompt can change later tokens even though the decode kernels are unchanged.
 
 ## REXL3 conversion error
 
@@ -57,6 +60,11 @@ BF16 GGUF exactly. These are weight errors, not output KLD:
 Against a double-precision reference at model geometry, the grouped EXL3 expert call over two rate pairs with situ has a maximum
 relative error of 5.94e-7 (0.0218 absolute on outputs of order 10^4). Its output equals separate uniform-rate calls bit for bit,
 including each row run alone. This tests arithmetic on the same quantized weights, not quantization loss.
+
+At the attention projection shapes (Q8_0, IQ2_S, IQ3_XXS and IQ3_S), the prompt products differ from FP64 on the same
+weights and q8_1 inputs by at most 2.61e-5 absolute, 4.01e-7 relative to the peak output. Against the decode matvecs the
+largest difference is on IQ2_S (8.02e-4 absolute, 3.19e-5 relative): the matvec truncates a fractional sub-block scale
+inside its integer dot. The repacked codes, widened scales and padding agree byte for byte with the host reference.
 
 ## The drafter
 
